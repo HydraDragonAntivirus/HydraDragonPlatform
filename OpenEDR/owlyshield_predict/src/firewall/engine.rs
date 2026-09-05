@@ -2154,9 +2154,10 @@ impl FirewallEngine {
                     if proxy_alive.load(Ordering::SeqCst) {
                         break;
                     }
-                    if !proxy_runtime.lock().unwrap().is_some() {
-                        // Proxy stop signal was sent or channel dropped
-                        break;
+                    if proxy_runtime.lock().unwrap().is_none() {
+                        // Proxy was stopped externally (stop_embedded_proxy):
+                        // exit quietly, there is nothing to report.
+                        return;
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -2176,14 +2177,18 @@ impl FirewallEngine {
                         ),
                     });
                 } else if still_running {
-                    proxy_alive.store(false, Ordering::SeqCst);
-                    proxy_runtime.lock().unwrap().take();
+                    // NEVER kill the proxy here. The waiter is observe-only:
+                    // taking the stop channel would drop stop_tx_main, fire
+                    // stop_rx in run_proxy, and shut down a proxy that may be
+                    // just about to finish binding (self-inflicted outage).
+                    // Log and leave the runtime alone; workers fail open
+                    // (no redirect) until proxy_alive flips true.
                     emit_log_event(LogEntry {
                         id: format!("{}-proxy-not-ready", now),
                         timestamp: now,
                         level: LogLevel::Warning,
                         message: format!(
-                            "Transparent TLS Proxy/Inspector did not become ready on {} - Windows proxy was left disabled to avoid breaking internet access",
+                            "Transparent TLS Proxy/Inspector not ready yet on {} - traffic flows direct until the listener comes up",
                             addr_string
                         ),
                     });
@@ -2998,6 +3003,12 @@ impl FirewallEngine {
                 .expect("failed to spawn windivert_flow_tracker thread");
         }
 
+        // Start the proxy listener BEFORE packet workers, so 127.0.0.1:<port>
+        // is already accepting by the time workers can redirect to it.
+        // (Binding is async, so the proxy_alive gate in the workers still
+        // covers the residual race: unready proxy => traffic flows direct.)
+        self.sync_proxy_runtime();
+
         // Worker Pool - 8 workers for parallel packet processing (matching original firewall GUI engine)
         let num_workers = 8;
         for worker_id in 0..num_workers {
@@ -3140,7 +3151,9 @@ impl FirewallEngine {
                                         let tls_proxy_cfg =
                                             settings_w.read().unwrap().tls_proxy.clone();
                                         let proxy_alive = proxy_alive_w.load(Ordering::SeqCst);
-                                        // CRITICAL FIX: Only redirect to proxy if enabled, auto-started, AND proxy listener is verified alive
+                                        // FAIL-OPEN GATE: redirect to 127.0.0.1:<port> ONLY
+                                        // while the listener is verified alive. Unready proxy
+                                        // => traffic flows direct, internet never breaks.
                                         if tls_proxy_cfg.mode == TlsInspectionMode::TlsProxy
                                             && tls_proxy_cfg.auto_start
                                             && proxy_alive
@@ -3229,9 +3242,14 @@ impl FirewallEngine {
                                                     if let (Some(orig_dst), Some(orig_src)) =
                                                         (dst_ip, src_ip)
                                                     {
+                                                        // IPv4 only: the embedded proxy binds
+                                                        // 127.0.0.1, so redirecting IPv6 to ::1
+                                                        // would hit a port nobody listens on (RST).
+                                                        // IPv6 flows direct (fail open) for now.
                                                         if !Self::is_loopback(orig_dst)
                                                             && !orig_dst.is_unspecified()
                                                             && !orig_dst.is_multicast()
+                                                            && orig_dst.is_ipv4()
                                                         {
                                                             nat_table_w.insert(
                                                                 src_port,
@@ -3343,9 +3361,9 @@ impl FirewallEngine {
                 .expect("failed to spawn packet worker");
         }
 
-        self.sync_proxy_runtime();
         // Mark started LAST: a registered-but-unstarted engine is a zombie
         // that blocks future Start calls, so this flag is the liveness proof.
+        // (Proxy was already kicked above, before the workers.)
         self.started.store(true, Ordering::SeqCst);
     }
 
