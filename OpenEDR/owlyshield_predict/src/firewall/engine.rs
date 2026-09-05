@@ -1245,12 +1245,16 @@ impl AppManager {
 // ============================================================================
 
 /// Key: client source port (unique per connection on the local machine).
-/// Value: (original_dst_ip, original_dst_port).
+/// Value: (original_dst_ip, original_dst_port, original_src_ip,
+///          original_if_idx, original_sub_if_idx).
 /// Used to reverse-NAT inbound packets from the proxy back to the original IP
-/// so the client's TCP stack accepts them.
+/// so the client's TCP stack accepts them. The interface indexes are restored
+/// on reinjection: without them a rewritten packet arrives on the loopback
+/// interface (IfIdx 1) while carrying non-loopback addresses, and tcpip.sys
+/// silently drops it as a martian/spoofed packet (443 black hole).
 #[derive(Clone)]
 pub struct TransparentNatTable {
-    inner: Arc<std::sync::RwLock<HashMap<u16, (IpAddr, u16, IpAddr)>>>,
+    inner: Arc<std::sync::RwLock<HashMap<u16, (IpAddr, u16, IpAddr, u32, u32)>>>,
 }
 
 impl TransparentNatTable {
@@ -1260,14 +1264,18 @@ impl TransparentNatTable {
         }
     }
 
-    pub fn insert(&self, client_src_port: u16, original_dst: (IpAddr, u16, IpAddr)) {
+    pub fn insert(
+        &self,
+        client_src_port: u16,
+        original_dst: (IpAddr, u16, IpAddr, u32, u32),
+    ) {
         self.inner
             .write()
             .unwrap()
             .insert(client_src_port, original_dst);
     }
 
-    pub fn get(&self, client_src_port: u16) -> Option<(IpAddr, u16, IpAddr)> {
+    pub fn get(&self, client_src_port: u16) -> Option<(IpAddr, u16, IpAddr, u32, u32)> {
         self.inner.read().unwrap().get(&client_src_port).copied()
     }
 
@@ -3147,6 +3155,8 @@ impl FirewallEngine {
                                         let mut recalc_checksums = decision.recalc_checksums;
                                         let mut loopback_flag = None;
                                         let mut outbound_flag = None;
+                                        let mut if_idx_flag: Option<u32> = None;
+                                        let mut sub_if_idx_flag: Option<u32> = None;
 
                                         let tls_proxy_cfg =
                                             settings_w.read().unwrap().tls_proxy.clone();
@@ -3163,6 +3173,13 @@ impl FirewallEngine {
                                             let mut dst_port = 0;
                                             let mut src_ip = None;
                                             let mut dst_ip = None;
+                                            // Targeted-interception verdict for THIS packet.
+                                            // SYN packets carry no SNI yet, so fall back to
+                                            // the DNS-snooped domain for the destination IP.
+                                            // Packets of an already-NATed connection keep
+                                            // flowing to the proxy (affinity) so a verdict
+                                            // flip mid-connection cannot strand the flow.
+                                            let mut intercept_allowed = false;
                                             if let Some((ref p_info, _)) = pre_parsed {
                                                 is_tcp = matches!(
                                                     p_info.protocol,
@@ -3172,6 +3189,21 @@ impl FirewallEngine {
                                                 dst_port = p_info.dst_port;
                                                 src_ip = Some(p_info.src_ip);
                                                 dst_ip = Some(p_info.dst_ip);
+                                                let dns_name = if p_info.hostname.is_none() {
+                                                    dns_w.resolve_ip(&p_info.dst_ip.to_string())
+                                                } else {
+                                                    None
+                                                };
+                                                let host = p_info
+                                                    .hostname
+                                                    .as_deref()
+                                                    .or(dns_name.as_deref());
+                                                intercept_allowed = Self::should_proxy_intercept(
+                                                    &tls_proxy_cfg,
+                                                    host,
+                                                    p_info.full_url.as_deref(),
+                                                    &sdk_w.read().unwrap(),
+                                                ) || nat_table_w.get(src_port).is_some();
                                             }
 
                                             if is_tcp {
@@ -3180,8 +3212,13 @@ impl FirewallEngine {
                                                     && src_port == tls_proxy_cfg.listen_port;
 
                                                 if proxy_return_flow {
-                                                    if let Some((orig_ip, orig_port, orig_src)) =
-                                                        nat_table_w.get(dst_port)
+                                                    if let Some((
+                                                        orig_ip,
+                                                        orig_port,
+                                                        orig_src,
+                                                        orig_if_idx,
+                                                        orig_sub_if_idx,
+                                                    )) = nat_table_w.get(dst_port)
                                                     {
                                                         let ok = match orig_ip {
                                                             IpAddr::V4(v4) => {
@@ -3229,6 +3266,12 @@ impl FirewallEngine {
                                                             recalc_checksums = true;
                                                             loopback_flag = Some(false);
                                                             outbound_flag = Some(false);
+                                                            // Restore the original NIC: without
+                                                            // this the packet arrives on IfIdx 1
+                                                            // (loopback) with non-loopback IPs
+                                                            // and tcpip.sys drops it as spoofed.
+                                                            if_idx_flag = Some(orig_if_idx);
+                                                            sub_if_idx_flag = Some(orig_sub_if_idx);
                                                             if tcp_is_fin_or_rst(&packet_data) {
                                                                 nat_table_w.remove(dst_port);
                                                             }
@@ -3236,6 +3279,7 @@ impl FirewallEngine {
                                                     }
                                                 } else if outbound
                                                     && dst_port == 443
+                                                    && intercept_allowed
                                                     && pid != std::process::id()
                                                     && !http_mitm_proxy::is_registered_upstream_local_port(src_port)
                                                 {
@@ -3253,7 +3297,15 @@ impl FirewallEngine {
                                                         {
                                                             nat_table_w.insert(
                                                                 src_port,
-                                                                (orig_dst, 443, orig_src),
+                                                                (
+                                                                    orig_dst,
+                                                                    443,
+                                                                    orig_src,
+                                                                    packet.address
+                                                                        .interface_index(),
+                                                                    packet.address
+                                                                        .subinterface_index(),
+                                                                ),
                                                             );
                                                             let ok = match orig_dst {
                                                                 IpAddr::V4(_v4) => {
@@ -3288,6 +3340,12 @@ impl FirewallEngine {
                                                                 loopback_flag = Some(true);
                                                                 // Local listeners only receive inbound packets; must clear outbound flag
                                                                 outbound_flag = Some(false);
+                                                                // Deliver via the loopback interface
+                                                                // (IfIdx 1); the original NIC index
+                                                                // is saved in the NAT table for the
+                                                                // return path.
+                                                                if_idx_flag = Some(1);
+                                                                sub_if_idx_flag = Some(0);
                                                                 if tcp_is_fin_or_rst(&packet_data) {
                                                                     nat_table_w.remove(src_port);
                                                                 }
@@ -3306,6 +3364,12 @@ impl FirewallEngine {
                                         }
                                         if let Some(val) = outbound_flag {
                                             reinject_address.as_mut().set_outbound(val);
+                                        }
+                                        if let Some(val) = if_idx_flag {
+                                            reinject_address.set_interface_index(val);
+                                        }
+                                        if let Some(val) = sub_if_idx_flag {
+                                            reinject_address.set_subinterface_index(val);
                                         }
                                         let mut reinject_packet = windivert::packet::WinDivertPacket {
                                             address: reinject_address,
