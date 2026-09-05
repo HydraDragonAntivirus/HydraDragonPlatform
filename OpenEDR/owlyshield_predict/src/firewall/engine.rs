@@ -1627,46 +1627,44 @@ impl FirewallEngine {
     }
 
     pub fn load_settings() -> Option<FirewallSettings> {
+        let template = PathBuf::from("json/settings.json");
         let pdata = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json");
-        // 1. ProgramData override wins when present and valid.
-        if pdata.exists() {
-            if let Ok(content) = fs::read_to_string(&pdata) {
-                if let Ok(s) = serde_json::from_str(&content) {
-                    return Some(s);
-                }
+        // 1. PRIORITY: template in Program Files / local directory.
+        //    If it exists and is valid JSON, read it, copy its contents
+        //    verbatim to ProgramData (overwrite), and load it into memory.
+        //    Never invent defaults here, never read the stale ProgramData file.
+        if let Ok(template_content) = fs::read_to_string(&template) {
+            if let Ok(settings) = serde_json::from_str::<FirewallSettings>(&template_content) {
+                Self::ensure_pdata_settings(&template_content);
+                return Some(settings);
+            }
+            // Template exists but is not valid JSON: do not overwrite
+            // ProgramData; fall through to the fallback below.
+        }
+        // 2. FALLBACK: only if the template is missing / invalid,
+        //    look at the ProgramData file.
+        if let Ok(content) = fs::read_to_string(&pdata) {
+            if let Ok(settings) = serde_json::from_str::<FirewallSettings>(&content) {
+                return Some(settings);
             }
         }
-        // 2. Shipped template in Program Files.
-        let path = PathBuf::from("json/settings.json");
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(s) = serde_json::from_str(&content) {
-                return Some(s);
-            }
-        }
-        // 3. Program Files json is gone (deleted): seed the ProgramData copy
-        // with defaults so the file exists going forward, and use it.
-        // The ProgramData file is created ONLY in this case — never while
-        // the shipped template is present.
-        let defaults = FirewallSettings::default();
-        Self::ensure_pdata_settings(&defaults);
-        Some(defaults)
+        // 3. Last resort: produce a default (in memory only, no disk write).
+        Some(FirewallSettings::default())
     }
 
-    /// Create the ProgramData settings file if missing. Called only when the
-    /// Program Files template is absent; never overwrites an existing file.
-    fn ensure_pdata_settings(settings: &FirewallSettings) {
+    /// Copies the verified contents of the "json/settings.json" template in
+    /// Program Files / local directory verbatim to
+    /// "C:\ProgramData\edrsvc\firewall_settings.json" (overwrite).
+    /// Never generates default settings, never reads the existing ProgramData
+    /// file. `template_content` must have been validated as proper JSON beforehand.
+    fn ensure_pdata_settings(template_content: &str) {
         let pdata = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json");
-        if pdata.exists() {
-            return;
-        }
         if let Some(parent) = pdata.parent() {
             if fs::create_dir_all(parent).is_err() {
                 return;
             }
         }
-        if let Ok(content) = serde_json::to_string_pretty(settings) {
-            let _ = fs::write(&pdata, content);
-        }
+        let _ = fs::write(&pdata, template_content);
     }
 
     pub fn apply_settings(&self, new_settings: FirewallSettings) {
@@ -1844,8 +1842,14 @@ impl FirewallEngine {
         };
 
         if let Ok(content) = serde_json::to_string_pretty(&settings) {
+            // Keep both files in sync: ProgramData and the local template.
             let _ = fs::create_dir_all("json");
-            let _ = fs::write("json/settings.json", content);
+            let _ = fs::write("json/settings.json", &content);
+            let pdata = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json");
+            if let Some(parent) = pdata.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&pdata, &content);
         }
     }
 
