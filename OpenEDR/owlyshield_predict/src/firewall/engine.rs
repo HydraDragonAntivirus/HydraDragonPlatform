@@ -1573,8 +1573,8 @@ impl FirewallEngine {
         map.insert(r"c:\program files\hydradragonantivirus\openedr\edrgui.exe".to_string(), AppDecision::Allow);
 
         let rules_path = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_rules.json");
-        let settings_path = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json");
-        let local_settings = PathBuf::from("json/settings.json");
+        let settings_path = Self::pdata_settings_path();
+        let local_settings_list = Self::template_candidates();
 
         // Helper to ingest decisions from JSON files
         let mut try_load_file = |path: &PathBuf| {
@@ -1619,29 +1619,68 @@ impl FirewallEngine {
             }
         };
 
-        try_load_file(&local_settings);
+        for local_settings in &local_settings_list {
+            try_load_file(local_settings);
+        }
         try_load_file(&settings_path);
         try_load_file(&rules_path);
 
         map
     }
 
+    fn pdata_settings_path() -> PathBuf {
+        PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json")
+    }
+
+    /// All locations where the shipped "json/settings.json" template may live.
+    /// Order matters: exe directory first (service install), then the canonical
+    /// Program Files path, then the CWD-relative path (dev runs).
+    /// A bare relative path alone breaks when running as a Windows service
+    /// because the service CWD is System32, not the install dir.
+    fn template_candidates() -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                out.push(dir.join("json").join("settings.json"));
+            }
+        }
+        out.push(PathBuf::from(
+            r"C:\Program Files\HydraDragonAntivirus\OpenEDR\json\settings.json",
+        ));
+        out.push(PathBuf::from("json/settings.json"));
+        // Deduplicate while preserving order.
+        let mut seen = HashSet::new();
+        out.into_iter()
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
+    }
+
     pub fn load_settings() -> Option<FirewallSettings> {
-        let template = PathBuf::from("json/settings.json");
-        let pdata = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json");
-        // 1. PRIORITY: template in Program Files / local directory.
+        let pdata = Self::pdata_settings_path();
+        // 1. PRIORITY: template in Program Files / exe directory.
         //    If it exists and is valid JSON, read it, copy its contents
         //    verbatim to ProgramData (overwrite), and load it into memory.
         //    Never invent defaults here, never read the stale ProgramData file.
-        if let Ok(template_content) = fs::read_to_string(&template) {
-            if let Ok(settings) = serde_json::from_str::<FirewallSettings>(&template_content) {
-                Self::ensure_pdata_settings(&template_content);
-                return Some(settings);
+        for template in Self::template_candidates() {
+            let Ok(template_content) = fs::read_to_string(&template) else {
+                continue;
+            };
+            match serde_json::from_str::<FirewallSettings>(&template_content) {
+                Ok(settings) => {
+                    Self::ensure_pdata_settings(&template_content);
+                    return Some(settings);
+                }
+                Err(e) => {
+                    // Template exists but is not valid JSON: do not overwrite
+                    // ProgramData; keep looking / fall through to fallback.
+                    eprintln!(
+                        "[firewall] ignoring invalid template {}: {e}",
+                        template.display()
+                    );
+                }
             }
-            // Template exists but is not valid JSON: do not overwrite
-            // ProgramData; fall through to the fallback below.
         }
-        // 2. FALLBACK: only if the template is missing / invalid,
+        // 2. FALLBACK: only if no template was found / valid,
         //    look at the ProgramData file.
         if let Ok(content) = fs::read_to_string(&pdata) {
             if let Ok(settings) = serde_json::from_str::<FirewallSettings>(&content) {
@@ -1652,19 +1691,27 @@ impl FirewallEngine {
         Some(FirewallSettings::default())
     }
 
-    /// Copies the verified contents of the "json/settings.json" template in
-    /// Program Files / local directory verbatim to
-    /// "C:\ProgramData\edrsvc\firewall_settings.json" (overwrite).
+    /// Copies the verified contents of the "json/settings.json" template
+    /// verbatim to "C:\ProgramData\edrsvc\firewall_settings.json" (overwrite).
     /// Never generates default settings, never reads the existing ProgramData
     /// file. `template_content` must have been validated as proper JSON beforehand.
     fn ensure_pdata_settings(template_content: &str) {
-        let pdata = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json");
+        let pdata = Self::pdata_settings_path();
         if let Some(parent) = pdata.parent() {
-            if fs::create_dir_all(parent).is_err() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "[firewall] failed to create ProgramData dir {}: {e}",
+                    parent.display()
+                );
                 return;
             }
         }
-        let _ = fs::write(&pdata, template_content);
+        if let Err(e) = fs::write(&pdata, template_content) {
+            eprintln!(
+                "[firewall] failed to copy template to {}: {e}",
+                pdata.display()
+            );
+        }
     }
 
     pub fn apply_settings(&self, new_settings: FirewallSettings) {
@@ -1843,13 +1890,36 @@ impl FirewallEngine {
 
         if let Ok(content) = serde_json::to_string_pretty(&settings) {
             // Keep both files in sync: ProgramData and the local template.
-            let _ = fs::create_dir_all("json");
-            let _ = fs::write("json/settings.json", &content);
-            let pdata = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json");
+            // Write to ProgramData plus every known template location so the
+            // install-dir copy and the dev-relative copy stay identical.
+            let pdata = Self::pdata_settings_path();
             if let Some(parent) = pdata.parent() {
-                let _ = fs::create_dir_all(parent);
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!(
+                        "[firewall] save_settings: failed to create {}: {e}",
+                        parent.display()
+                    );
+                }
             }
-            let _ = fs::write(&pdata, &content);
+            if let Err(e) = fs::write(&pdata, &content) {
+                eprintln!(
+                    "[firewall] save_settings: failed to write {}: {e}",
+                    pdata.display()
+                );
+            }
+            for template in Self::template_candidates() {
+                if let Some(parent) = template.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                }
+                if let Err(e) = fs::write(&template, &content) {
+                    eprintln!(
+                        "[firewall] save_settings: failed to write {}: {e}",
+                        template.display()
+                    );
+                }
+            }
         }
     }
 
