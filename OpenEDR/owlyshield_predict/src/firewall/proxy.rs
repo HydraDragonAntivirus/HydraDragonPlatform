@@ -442,6 +442,29 @@ pub async fn run_proxy(
                         let settings = settings.clone();
                         let web_filter = web_filter.clone();
 
+                        // Doorbell: fires once TCP+TLS accept and HTTP parse
+                        // succeed, BEFORE any upstream work. If steer lines
+                        // exist but accept lines never do, steered packets
+                        // never reach this socket (delivery path). If accept
+                        // lines exist but no Proxy:/proxy-err follows, the
+                        // handler hangs downstream (now bounded by the
+                        // upstream timeout below).
+                        let peer = req
+                            .extensions()
+                            .get::<http_mitm_proxy::RemoteAddr>()
+                            .map(|r| r.0.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let accept_ts = now_ts();
+                        emit_log_event(LogEntry {
+                            id: format!("{}-proxy-accept", accept_ts),
+                            timestamp: accept_ts,
+                            level: LogLevel::Info,
+                            message: format!(
+                                "Proxy accept: inbound connection from {}",
+                                peer
+                            ),
+                        });
+
                         async move {
                             // Wrap in generic error handler: all errors return 502
                             match handle_proxy_request(client, sdk, settings, web_filter, req).await {
@@ -863,10 +886,28 @@ async fn handle_proxy_request(
     // (RST/10054/connection error) blackholes healthy domains for an hour,
     // so upstream failures only produce a 502 here. Real pinning bypasses
     // remain available via explicit user bypass_hosts configuration.
-    let (res, _) = match client.send_request(req).await {
-        Ok(response) => response,
-        Err(e) => {
+    // Bounded upstream call: an unbounded await here hangs silently
+    // (no Proxy: line, no proxy-err) when the upstream path blackholes,
+    // which looks exactly like a delivery failure in logs. Timeout turns
+    // it into a visible error + 502 instead.
+    let (res, _) = match tokio::time::timeout(
+        std::time::Duration::from_secs(request_timeout.max(1)),
+        client.send_request(req),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
             return Err(format!("Upstream failed: {}", e));
+        }
+        Err(_) => {
+            return Err(format!(
+                "Upstream timed out after {}s: {}{}{}",
+                request_timeout.max(1),
+                scheme,
+                host,
+                path
+            ));
         }
     };
 
