@@ -36,7 +36,8 @@
     "handshake_timeout_ms": 5000,
     "request_timeout_secs": 30,
     "response_timeout_secs": 30,
-    "show_blocked_only": false
+    "show_blocked_only": false,
+    "inspect_full_responses": false
   },
   "metadata": {
     "version": "2.0.0",

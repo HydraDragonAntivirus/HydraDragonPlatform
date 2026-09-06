@@ -556,10 +556,16 @@ async fn handle_proxy_request(
     // ── Validate request ────────────────────────────────────────────────────
     validate_request(&req)?;
 
-    // Determine MAX_BODY and timeouts based on settings
+    // Determine MAX_BODY and timeouts based on settings.
+    // Full-response inspection is independent from log verbosity:
+    // log_full_bodies only affects what is written to logs, while
+    // inspect_full_responses decides how much of an intercepted body the
+    // SDK rules actually get to see (streaming tail bypasses inspection).
     let (max_body, request_timeout, response_timeout) = {
         let settings_guard = settings.read().unwrap();
-        let max = if settings_guard.log_full_bodies {
+        let max = if settings_guard.log_full_bodies
+            || settings_guard.tls_proxy.inspect_full_responses
+        {
             usize::MAX
         } else {
             64 * 1024

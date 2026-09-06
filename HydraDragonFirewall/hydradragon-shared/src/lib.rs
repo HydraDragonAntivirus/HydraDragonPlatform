@@ -120,6 +120,12 @@ pub struct TlsProxyConfig {
     pub response_timeout_secs: u64,
     #[serde(default)]
     pub show_blocked_only: bool,
+    /// Whether intercepted response bodies are fully buffered and inspected
+    /// by SDK rules (true) or only the head is inspected while the tail
+    /// streams through untouched (false, default). Independent from
+    /// log_full_bodies, which only controls log verbosity.
+    #[serde(default)]
+    pub inspect_full_responses: bool,
 }
 
 fn default_mitm_all_traffic() -> bool {
@@ -148,6 +154,7 @@ impl Default for TlsProxyConfig {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             response_timeout_secs: DEFAULT_RESPONSE_TIMEOUT_SECS,
             show_blocked_only: false,
+            inspect_full_responses: false,
         }
     }
 }
