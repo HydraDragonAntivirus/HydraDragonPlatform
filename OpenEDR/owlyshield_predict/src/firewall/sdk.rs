@@ -4,7 +4,7 @@
 // Traffic Attack, Block, Allow, Ask, Change Packet, Solve Packet,
 // Port, Localhost, Routine, AND/OR Conditions, Rule Name, Description
 
-use super::engine::{FirewallSettings, PacketInfo, Protocol};
+use super::engine::{FirewallSettings, LogEntry, LogLevel, PacketInfo, Protocol, emit_log_event};
 use base64::Engine;
 use daachorse::DoubleArrayAhoCorasick;
 use regex::Regex;
@@ -16,6 +16,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing;
+
+/// Millis timestamp for diagnostics. Diagnostics go through emit_log_event,
+/// never eprintln: a Windows service has no console, so stderr text is lost.
+fn sdk_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 // ============================================================================
 // ENCODING SUPPORT (Features 1-4)
@@ -2325,10 +2334,16 @@ impl SdkRegistry {
                 if rules_file.is_file() {
                     let path_str = rules_file.to_string_lossy().to_string();
                     if self.load_rules_from_file(&path_str).is_ok() {
-                        println!(
-                            "[SDK] Loaded {} rules from registry-defined path",
-                            self.rules.len()
-                        );
+                        let now = sdk_now_ms();
+                        emit_log_event(LogEntry {
+                            id: format!("{}-sdk-rules-loaded", now),
+                            timestamp: now,
+                            level: LogLevel::Info,
+                            message: format!(
+                                "[SDK] Loaded {} rules from registry-defined path",
+                                self.rules.len()
+                            ),
+                        });
                         return;
                     }
                 }
@@ -2342,13 +2357,25 @@ impl SdkRegistry {
                 self.monitored_sites = rule_file.monitored_sites;
                 self.rules = Self::sanitize_rules(rule_file.rules);
                 self.rebuild_match_index();
-                println!(
-                    "[SDK] Loaded {} rules from firewall-rules/rules.yaml",
-                    rule_count
-                );
+                let now = sdk_now_ms();
+                emit_log_event(LogEntry {
+                    id: format!("{}-sdk-rules-loaded", now),
+                    timestamp: now,
+                    level: LogLevel::Info,
+                    message: format!(
+                        "[SDK] Loaded {} rules from firewall-rules/rules.yaml",
+                        rule_count
+                    ),
+                });
             }
             Err(e) => {
-                eprintln!("[SDK] Failed to load firewall-rules/rules.yaml: {}", e);
+                let now = sdk_now_ms();
+                emit_log_event(LogEntry {
+                    id: format!("{}-sdk-rules-load", now),
+                    timestamp: now,
+                    level: LogLevel::Warning,
+                    message: format!("[SDK] Failed to load firewall-rules/rules.yaml: {}", e),
+                });
             }
         }
 
@@ -2901,10 +2928,16 @@ impl SdkRegistry {
                 && rule.entropy_threshold == Some(7.95);
 
             if rule.enabled && (is_named_entropy_prompt || rule.is_entropy_only_ask_rule()) {
-                println!(
-                    "[SDK] Disabling entropy-only ask rule [{}] to keep network decisions off the hot path",
-                    rule.name
-                );
+                let now = sdk_now_ms();
+                emit_log_event(LogEntry {
+                    id: format!("{}-sdk-entropy-rule", now),
+                    timestamp: now,
+                    level: LogLevel::Info,
+                    message: format!(
+                        "[SDK] Disabling entropy-only ask rule [{}] to keep network decisions off the hot path",
+                        rule.name
+                    ),
+                });
                 rule.enabled = false;
             }
         }
@@ -2934,10 +2967,16 @@ impl SdkRegistry {
         for (rule_name, deps) in &dep_map {
             for dep in deps {
                 if !all_rule_names.contains(dep) {
-                    eprintln!(
-                        "[SDK] Warning: Rule '{}' depends on '{}' which does not exist",
-                        rule_name, dep
-                    );
+                    let now = sdk_now_ms();
+                    emit_log_event(LogEntry {
+                        id: format!("{}-sdk-dep-missing", now),
+                        timestamp: now,
+                        level: LogLevel::Warning,
+                        message: format!(
+                            "[SDK] Warning: Rule '{}' depends on '{}' which does not exist",
+                            rule_name, dep
+                        ),
+                    });
                 }
             }
         }
@@ -2948,11 +2987,16 @@ impl SdkRegistry {
             let mut stack = HashSet::new();
 
             if Self::has_circular_dependency(rule_name, &dep_map, &mut visited, &mut stack) {
-                eprintln!(
-                    "[SDK] Error: Circular dependency detected involving rule '{}'",
-                    rule_name
-                );
-                eprintln!("[SDK] Dependency chain: {:?}", stack);
+                let now = sdk_now_ms();
+                emit_log_event(LogEntry {
+                    id: format!("{}-sdk-dep-cycle", now),
+                    timestamp: now,
+                    level: LogLevel::Warning,
+                    message: format!(
+                        "[SDK] Error: Circular dependency detected involving rule '{}'. Chain: {:?}",
+                        rule_name, stack
+                    ),
+                });
             }
         }
     }
@@ -2999,10 +3043,16 @@ impl SdkRegistry {
     pub fn toggle_rule(&mut self, name: &str, enabled: bool) -> bool {
         if let Some(rule) = self.rules.iter_mut().find(|r| r.name == name) {
             if enabled && rule.is_entropy_only_ask_rule() {
-                println!(
-                    "[SDK] Refusing to enable entropy-only ask rule [{}] because it harms the hot path",
-                    rule.name
-                );
+                let now = sdk_now_ms();
+                emit_log_event(LogEntry {
+                    id: format!("{}-sdk-entropy-rule", now),
+                    timestamp: now,
+                    level: LogLevel::Warning,
+                    message: format!(
+                        "[SDK] Refusing to enable entropy-only ask rule [{}] because it harms the hot path",
+                        rule.name
+                    ),
+                });
                 rule.enabled = false;
                 return false;
             }

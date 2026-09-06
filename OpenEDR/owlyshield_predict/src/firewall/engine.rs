@@ -1682,10 +1682,20 @@ impl FirewallEngine {
                 Err(e) => {
                     // Template exists but is not valid JSON: do not overwrite
                     // ProgramData; keep looking / fall through to fallback.
-                    eprintln!(
-                        "[firewall] ignoring invalid template {}: {e}",
-                        template.display()
-                    );
+                    // Logged via emit_log_event (NOT eprintln): a Windows
+                    // service has no console, so a stderr-only warning would
+                    // be invisible and the silent fallback to a stale
+                    // ProgramData file would look like "settings ignored".
+                    let now = Self::now_ts();
+                    emit_log_event(LogEntry {
+                        id: format!("{}-settings-invalid", now),
+                        timestamp: now,
+                        level: LogLevel::Warning,
+                        message: format!(
+                            "Ignoring invalid settings template {}: {e} (falling back)",
+                            template.display()
+                        ),
+                    });
                 }
             }
         }
@@ -1705,21 +1715,34 @@ impl FirewallEngine {
     /// Never generates default settings, never reads the existing ProgramData
     /// file. `template_content` must have been validated as proper JSON beforehand.
     fn ensure_pdata_settings(template_content: &str) {
+        // NOTE: diagnostics go through emit_log_event, never eprintln: a
+        // Windows service has no console, so stderr text is lost.
+        let now = Self::now_ts();
         let pdata = Self::pdata_settings_path();
         if let Some(parent) = pdata.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!(
-                    "[firewall] failed to create ProgramData dir {}: {e}",
-                    parent.display()
-                );
+                emit_log_event(LogEntry {
+                    id: format!("{}-pdata-mkdir", now),
+                    timestamp: now,
+                    level: LogLevel::Warning,
+                    message: format!(
+                        "[firewall] failed to create ProgramData dir {}: {e}",
+                        parent.display()
+                    ),
+                });
                 return;
             }
         }
         if let Err(e) = fs::write(&pdata, template_content) {
-            eprintln!(
-                "[firewall] failed to copy template to {}: {e}",
-                pdata.display()
-            );
+            emit_log_event(LogEntry {
+                id: format!("{}-pdata-copy", now),
+                timestamp: now,
+                level: LogLevel::Warning,
+                message: format!(
+                    "[firewall] failed to copy template to {}: {e}",
+                    pdata.display()
+                ),
+            });
         }
     }
 
@@ -1916,20 +1939,33 @@ impl FirewallEngine {
             // Keep both files in sync: ProgramData and the local template.
             // Write to ProgramData plus every known template location so the
             // install-dir copy and the dev-relative copy stay identical.
+            // Diagnostics go through emit_log_event, never eprintln (a
+            // Windows service has no console).
+            let now = Self::now_ts();
             let pdata = Self::pdata_settings_path();
             if let Some(parent) = pdata.parent() {
                 if let Err(e) = fs::create_dir_all(parent) {
-                    eprintln!(
-                        "[firewall] save_settings: failed to create {}: {e}",
-                        parent.display()
-                    );
+                    emit_log_event(LogEntry {
+                        id: format!("{}-save-mkdir", now),
+                        timestamp: now,
+                        level: LogLevel::Warning,
+                        message: format!(
+                            "[firewall] save_settings: failed to create {}: {e}",
+                            parent.display()
+                        ),
+                    });
                 }
             }
             if let Err(e) = fs::write(&pdata, &content) {
-                eprintln!(
-                    "[firewall] save_settings: failed to write {}: {e}",
-                    pdata.display()
-                );
+                emit_log_event(LogEntry {
+                    id: format!("{}-save-pdata", now),
+                    timestamp: now,
+                    level: LogLevel::Warning,
+                    message: format!(
+                        "[firewall] save_settings: failed to write {}: {e}",
+                        pdata.display()
+                    ),
+                });
             }
             for template in Self::template_candidates() {
                 if let Some(parent) = template.parent() {
@@ -1938,10 +1974,15 @@ impl FirewallEngine {
                     }
                 }
                 if let Err(e) = fs::write(&template, &content) {
-                    eprintln!(
-                        "[firewall] save_settings: failed to write {}: {e}",
-                        template.display()
-                    );
+                    emit_log_event(LogEntry {
+                        id: format!("{}-save-template", now),
+                        timestamp: now,
+                        level: LogLevel::Warning,
+                        message: format!(
+                            "[firewall] save_settings: failed to write {}: {e}",
+                            template.display()
+                        ),
+                    });
                 }
             }
         }
@@ -2548,7 +2589,15 @@ impl FirewallEngine {
         if let Some(tx) = tx_opt {
             let _ = tx.send(message);
         } else {
-            eprintln!("[HydraNet] No active pipe writer available for outbound message");
+            // emit_log_event, never eprintln (no console on a service).
+            let now = Self::now_ts();
+            emit_log_event(LogEntry {
+                id: format!("{}-hydranet-nowriter", now),
+                timestamp: now,
+                level: LogLevel::Warning,
+                message:
+                    "[HydraNet] No active pipe writer available for outbound message".to_string(),
+            });
         }
     }
 

@@ -50,7 +50,17 @@ pub fn run() {
 
     let engine = Arc::new(FirewallEngine::new());
     if !headless::register(Arc::clone(&engine)) {
-        eprintln!("HydraDragon Firewall: engine is already registered.");
+        // emit_log_event, never eprintln (no console on a service).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        emit_log_event(LogEntry {
+            id: format!("{}-already-registered", now),
+            timestamp: now,
+            level: LogLevel::Warning,
+            message: "HydraDragon Firewall: engine is already registered.".to_string(),
+        });
         return;
     }
 
