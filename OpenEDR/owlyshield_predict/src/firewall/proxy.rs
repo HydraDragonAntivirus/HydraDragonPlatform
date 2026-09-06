@@ -416,23 +416,13 @@ pub async fn run_proxy(
                             match handle_proxy_request(client, sdk, settings, web_filter, req).await {
                                 Ok(res) => Ok::<_, http_mitm_proxy::default_client::Error>(res),
                                 Err(e) => {
-                                    let is_ignorable = e.contains("10054")
-                                        || e.contains("connection error")
-                                        || e.contains("http2 error")
-                                        || e.contains("Request body read failed")
-                                        || e.contains("Response body read failed")
-                                        || e.contains("timed out")
-                                        || e.contains("Broken pipe");
-
-                                    if !is_ignorable {
-                                        let ts = now_ts();
-                                        emit_log_event(LogEntry {
-                                            id: format!("{}-proxy-err", ts),
-                                            timestamp: ts,
-                                            level: LogLevel::Warning,
-                                            message: format!("Proxy warning: {}", e),
-                                        });
-                                    }
+                                    let ts = now_ts();
+                                    emit_log_event(LogEntry {
+                                        id: format!("{}-proxy-err", ts),
+                                        timestamp: ts,
+                                        level: LogLevel::Warning,
+                                        message: format!("Proxy warning: {}", e),
+                                    });
                                     Ok::<_, http_mitm_proxy::default_client::Error>(
                                         error_response_502(),
                                     )
