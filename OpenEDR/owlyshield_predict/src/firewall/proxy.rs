@@ -633,25 +633,20 @@ async fn handle_proxy_request(
     let referer = request_headers.get("referer").cloned();
 
     // ── Collect request body with timeout ───────────────────────────────────
+    // Working-GUI parity: ALWAYS drain the body via collect(). Skipping the
+    // read for GET/HEAD/OPTIONS leaves framing bytes (e.g. chunked) unread;
+    // closing with unread data in the socket buffer makes Hyper emit TCP RST.
     let (parts, body) = req.into_parts();
-    let is_bodiless = parts.method == http_mitm_proxy::hyper::Method::GET
-        || parts.method == http_mitm_proxy::hyper::Method::HEAD
-        || parts.method == http_mitm_proxy::hyper::Method::OPTIONS;
-
     let req_content_length = request_headers.get("content-length").map(|s| s.as_str());
-    let raw_body: Bytes = if is_bodiless && req_content_length.map_or(true, |l| l == "0") {
-        Bytes::new()
-    } else {
-        match tokio::time::timeout(
-            adaptive_body_timeout(request_timeout, req_content_length),
-            body.collect(),
-        )
-        .await
-        {
-            Ok(Ok(collected)) => collected.to_bytes(),
-            Ok(Err(_)) => Bytes::new(),
-            Err(_) => Bytes::new(),
-        }
+    let raw_body: Bytes = match tokio::time::timeout(
+        adaptive_body_timeout(request_timeout, req_content_length),
+        body.collect(),
+    )
+    .await
+    {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(_)) => Bytes::new(),
+        Err(_) => Bytes::new(),
     };
     let body_truncated = raw_body.len() > max_body;
     let body_bytes = if body_truncated {
@@ -815,22 +810,14 @@ async fn handle_proxy_request(
 
     // ── Forward upstream (matches working GUI proxy: no aggressive timeout) ──
     // The old working proxy does `client.send_request(req).await` with no
-    // connect timeout. A short timeout 502s slow sites and then poisons the
-    // pinning-fallback cache, breaking internet. Only mark pinning fallback
-    // on real cert/TLS/handshake failures, never on timeouts.
+    // connect timeout and NEVER poisons a fallback cache on failure.
+    // Auto-marking hosts as pinning-fallback on generic transport errors
+    // (RST/10054/connection error) blackholes healthy domains for an hour,
+    // so upstream failures only produce a 502 here. Real pinning bypasses
+    // remain available via explicit user bypass_hosts configuration.
     let (res, _) = match client.send_request(req).await {
         Ok(response) => response,
         Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("10054")
-                || err_str.contains("certificate")
-                || err_str.contains("tls")
-                || err_str.contains("handshake")
-                || err_str.contains("http2")
-                || err_str.contains("connection error")
-            {
-                mark_host_as_pinning_fallback(&host);
-            }
             return Err(format!("Upstream failed: {}", e));
         }
     };

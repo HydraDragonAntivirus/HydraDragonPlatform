@@ -3173,12 +3173,18 @@ impl FirewallEngine {
                                             let mut dst_port = 0;
                                             let mut src_ip = None;
                                             let mut dst_ip = None;
-                                            // Targeted-interception verdict for THIS packet.
-                                            // SYN packets carry no SNI yet, so fall back to
-                                            // the DNS-snooped domain for the destination IP.
-                                            // Packets of an already-NATed connection keep
-                                            // flowing to the proxy (affinity) so a verdict
-                                            // flip mid-connection cannot strand the flow.
+                                            // Flow-pinned interception verdict (SYN-anchored).
+                                            // A TCP connection's fate is decided ONCE, at SYN:
+                                            // - SYN carries no SNI/payload, so fall back to the
+                                            //   DNS-snooped domain for the destination IP.
+                                            // - Packets of an already-NATed connection keep
+                                            //   flowing to the proxy (affinity).
+                                            // - Non-SYN packets of a never-NATed flow are NEVER
+                                            //   hijacked mid-stream, even if SNI now matches:
+                                            //   the proxy never saw this flow's SYN, so a late
+                                            //   redirect would arrive as bare payload and draw
+                                            //   an immediate RST (retransmission loop). Fail
+                                            //   open instead: let it flow direct.
                                             let mut intercept_allowed = false;
                                             if let Some((ref p_info, _)) = pre_parsed {
                                                 is_tcp = matches!(
@@ -3189,21 +3195,36 @@ impl FirewallEngine {
                                                 dst_port = p_info.dst_port;
                                                 src_ip = Some(p_info.src_ip);
                                                 dst_ip = Some(p_info.dst_ip);
-                                                let dns_name = if p_info.hostname.is_none() {
-                                                    dns_w.resolve_ip(&p_info.dst_ip.to_string())
+                                                // SYN flag (0x02) set => connection initiator.
+                                                // Parsed flags already account for variable IP/TCP
+                                                // header lengths (IPv4 options, IPv6), unlike a
+                                                // fixed raw offset.
+                                                let is_syn_packet =
+                                                    p_info.tcp_flags.is_some_and(|f| f & 0x02 != 0);
+                                                if nat_table_w.get(src_port).is_some() {
+                                                    // Affinity: flow already NATed at SYN time.
+                                                    intercept_allowed = true;
+                                                } else if is_syn_packet {
+                                                    // New flow: pin the verdict now.
+                                                    let dns_name = if p_info.hostname.is_none() {
+                                                        dns_w.resolve_ip(&p_info.dst_ip.to_string())
+                                                    } else {
+                                                        None
+                                                    };
+                                                    let host = p_info
+                                                        .hostname
+                                                        .as_deref()
+                                                        .or(dns_name.as_deref());
+                                                    intercept_allowed = Self::should_proxy_intercept(
+                                                        &tls_proxy_cfg,
+                                                        host,
+                                                        p_info.full_url.as_deref(),
+                                                        &sdk_w.read().unwrap(),
+                                                    );
                                                 } else {
-                                                    None
-                                                };
-                                                let host = p_info
-                                                    .hostname
-                                                    .as_deref()
-                                                    .or(dns_name.as_deref());
-                                                intercept_allowed = Self::should_proxy_intercept(
-                                                    &tls_proxy_cfg,
-                                                    host,
-                                                    p_info.full_url.as_deref(),
-                                                    &sdk_w.read().unwrap(),
-                                                ) || nat_table_w.get(src_port).is_some();
+                                                    // Mid-flow packet of a direct flow: do not hijack.
+                                                    intercept_allowed = false;
+                                                }
                                             }
 
                                             if is_tcp {

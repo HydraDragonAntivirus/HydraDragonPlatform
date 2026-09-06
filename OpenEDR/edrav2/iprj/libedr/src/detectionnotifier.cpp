@@ -927,9 +927,12 @@ Variant DetectionNotifier::execute(Variant vCommand, Variant vParams)
 			sTitle += (sTitle.empty() ? "" : ": ") + sPath;
 
 		// Surface the flagged registry key itself (virus/PUA persistence):
-		// operators must see WHICH key, not just which process. Falls back
-		// to the raw path when abstractPath is empty.
-		if (vEvent.has("registryDeleteTarget") || vEvent.has("registryDeleteTargetRaw"))
+		// operators must see WHICH key, not just which process. Primary
+		// source is the PTM "registryDeleteTarget" field, but MLE detections
+		// (e.g. mle_pua_registry_write) usually don't carry it; fall back to
+		// the enriched registry object the event enricher always populates
+		// for registry telemetry (abstractPath -> path -> rawPath), plus the
+		// value name when present so FP triage can pinpoint the entry.
 		{
 			try
 			{
@@ -943,8 +946,21 @@ Variant DetectionNotifier::execute(Variant vCommand, Variant vParams)
 					if (!sRawTitle.empty() && sRawTitle != "<undefined>" && sRawTitle != "null")
 						sRegTitle = sRawTitle;
 				}
+				if (sRegTitle.empty() || sRegTitle == "<undefined>" || sRegTitle == "null")
+				{
+					sRegTitle = tryPaths({
+						"registry.abstractPath",
+						"registry.path",
+						"registry.rawPath"
+					});
+				}
 				if (!sRegTitle.empty() && sRegTitle != "<undefined>" && sRegTitle != "null")
+				{
+					const std::string sRegValue = extractValidPath("registry.name");
+					if (!sRegValue.empty())
+						sRegTitle += " [" + sRegValue + "]";
 					sTitle += (sTitle.empty() ? "" : " | reg: ") + sRegTitle;
+				}
 			}
 			catch (...) {}
 		}
