@@ -42,15 +42,6 @@ impl CidrIndex {
     }
 
     fn add(&mut self, cidr: &str) -> bool {
-        let trimmed = cidr.trim();
-        if trimmed == "0.0.0.0/0"
-            || trimmed == "0.0.0.0"
-            || trimmed == "::/0"
-            || trimmed == "::"
-            || trimmed.ends_with("/0")
-        {
-            return false;
-        }
         match Self::parse_interval(cidr) {
             Some(CidrInterval::V4(start, end)) => {
                 self.v4.push((start, end));
@@ -70,9 +61,6 @@ impl CidrIndex {
     }
 
     fn contains(&self, ip: IpAddr) -> bool {
-        if ip.is_unspecified() || ip.is_loopback() {
-            return false;
-        }
         match ip {
             IpAddr::V4(ipv4) => Self::contains_value(&self.v4, u32::from(ipv4)),
             IpAddr::V6(ipv6) => Self::contains_value(&self.v6, u128::from(ipv6)),
@@ -85,22 +73,28 @@ impl CidrIndex {
             let prefix_len = prefix.parse::<u32>().ok()?;
 
             if let Ok(ipv4) = network.parse::<Ipv4Addr>() {
-                // 0.0.0.0/0 protection: prefix_len == 0 or unspecified IP matches entire IPv4 space
-                if prefix_len == 0 || prefix_len > 32 || ipv4.is_unspecified() {
+                if prefix_len > 32 {
                     return None;
                 }
-                let mask = !0u32 << (32 - prefix_len);
+                let mask = if prefix_len == 0 {
+                    0
+                } else {
+                    !0u32 << (32 - prefix_len)
+                };
                 let start = u32::from(ipv4) & mask;
                 let end = start | !mask;
                 return Some(CidrInterval::V4(start, end));
             }
 
             if let Ok(ipv6) = network.parse::<Ipv6Addr>() {
-                // ::/0 protection: prefix_len == 0 or unspecified IP matches entire IPv6 space
-                if prefix_len == 0 || prefix_len > 128 || ipv6.is_unspecified() {
+                if prefix_len > 128 {
                     return None;
                 }
-                let mask = !0u128 << (128 - prefix_len);
+                let mask = if prefix_len == 0 {
+                    0
+                } else {
+                    !0u128 << (128 - prefix_len)
+                };
                 let start = u128::from(ipv6) & mask;
                 let end = start | !mask;
                 return Some(CidrInterval::V6(start, end));
@@ -111,16 +105,10 @@ impl CidrIndex {
 
         match cidr.parse::<IpAddr>().ok()? {
             IpAddr::V4(ipv4) => {
-                if ipv4.is_unspecified() || ipv4.is_broadcast() {
-                    return None;
-                }
                 let value = u32::from(ipv4);
                 Some(CidrInterval::V4(value, value))
             }
             IpAddr::V6(ipv6) => {
-                if ipv6.is_unspecified() {
-                    return None;
-                }
                 let value = u128::from(ipv6);
                 Some(CidrInterval::V6(value, value))
             }
@@ -203,7 +191,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    pub fn label(&self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             Protocol::TCP => "TCP",
             Protocol::UDP => "UDP",
@@ -261,8 +249,6 @@ pub struct PacketInfo {
     pub http_request_body: Option<String>,
     /// Decrypted HTTP response body captured by the Transparent TLS Proxy (UTF-8 text or hex)
     pub http_response_body: Option<String>,
-    /// Raw TCP flags byte (SYN, ACK, FIN, RST, PSH, URG)
-    pub tcp_flags: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -695,8 +681,6 @@ impl FirewallRule {
 pub struct FirewallSettings {
     #[serde(default)]
     pub kernel_block_paths: Vec<String>,
-    #[serde(default)]
-    pub default_deny: bool,
     pub late_blocking_mode: bool,
     #[serde(default)]
     pub headless_mode: bool,
@@ -738,7 +722,6 @@ impl Default for FirewallSettings {
 
         Self {
             kernel_block_paths: Vec::new(),
-            default_deny: false,
             late_blocking_mode: true,
             headless_mode: false,
             log_mode: false,
@@ -768,11 +751,6 @@ pub struct Statistics {
     pub tcp_connections: AtomicU64,
     pub last_log_time: AtomicU64,         // Rate limiting for blocked
     pub last_allowed_log_time: AtomicU64, // Rate limiting for allowed
-    /// Packets lost because BOTH the processed reinject and the raw
-    /// fail-open fallback send failed (transport/queue/driver level).
-    pub reinject_failed: AtomicU64,
-    /// Rate limiting for the reinject-failed transport alarm below.
-    pub last_reinject_fail_log: AtomicU64,
 }
 
 impl Default for Statistics {
@@ -787,8 +765,6 @@ impl Default for Statistics {
             tcp_connections: AtomicU64::new(0),
             last_log_time: AtomicU64::new(0),
             last_allowed_log_time: AtomicU64::new(0),
-            reinject_failed: AtomicU64::new(0),
-            last_reinject_fail_log: AtomicU64::new(0),
         }
     }
 }
@@ -997,7 +973,7 @@ pub struct AppManager {
     pub suspicious_pids: RwLock<HashSet<u32>>,
     pub cloud_trusted_pids: RwLock<HashSet<u32>>,
     pub openedr_verdicts: RwLock<HashMap<u32, String>>,
-    pub sig_cache: RwLock<HashMap<String, crate::signature_verification::SignatureInfo>>,
+    pub threat_intel: Arc<crate::threat_intel::ThreatIntelScanner>,
     /// Tracks which slot (0-based) the user is currently viewing, for the position counter.
     pub view_index: AtomicU64,
 }
@@ -1016,32 +992,19 @@ impl AppManager {
             suspicious_pids: RwLock::new(HashSet::new()),
             cloud_trusted_pids: RwLock::new(HashSet::new()),
             openedr_verdicts: RwLock::new(HashMap::new()),
-            sig_cache: RwLock::new(HashMap::new()),
+            threat_intel: Arc::new(crate::threat_intel::ThreatIntelScanner::load_default()),
             view_index: AtomicU64::new(0),
         }
     }
 
-    pub fn get_or_verify_sig(&self, app_path: &str) -> crate::signature_verification::SignatureInfo {
-        if app_path.is_empty() {
-            return crate::signature_verification::SignatureInfo::default();
-        }
-        {
-            let cache = self.sig_cache.read().unwrap();
-            if let Some(info) = cache.get(app_path) {
-                return info.clone();
-            }
-        }
-        let info = crate::signature_verification::verify_signature(Path::new(app_path));
-        let mut cache = self.sig_cache.write().unwrap();
-        cache.insert(app_path.to_string(), info.clone());
-        info
-    }
-
     pub fn update_port_mapping(&self, port: u16, pid: u32) {
-        if port == 0 || pid == 0 {
+        if port == 0 {
             return;
         }
         let mut map = self.port_map.write().unwrap();
+        if map.len() > 16384 {
+            map.clear();
+        }
         map.insert(port, pid);
     }
 
@@ -1252,11 +1215,9 @@ impl AppManager {
 // ============================================================================
 
 /// Key: client source port (unique per connection on the local machine).
-/// Value: (original_dst_ip, original_dst_port, original_src_ip).
+/// Value: (original_dst_ip, original_dst_port).
 /// Used to reverse-NAT inbound packets from the proxy back to the original IP
-/// so the client's TCP stack accepts them. The interface index is never
-/// touched: the return packet is loopback-born and WinDivert delivers it to
-/// the local socket itself once loopback/outbound flags are cleared.
+/// so the client's TCP stack accepts them.
 #[derive(Clone)]
 pub struct TransparentNatTable {
     inner: Arc<std::sync::RwLock<HashMap<u16, (IpAddr, u16, IpAddr)>>>,
@@ -1270,10 +1231,11 @@ impl TransparentNatTable {
     }
 
     pub fn insert(&self, client_src_port: u16, original_dst: (IpAddr, u16, IpAddr)) {
-        self.inner
-            .write()
-            .unwrap()
-            .insert(client_src_port, original_dst);
+        let mut guard = self.inner.write().unwrap();
+        if guard.len() > 16384 {
+            guard.clear();
+        }
+        guard.insert(client_src_port, original_dst);
     }
 
     pub fn get(&self, client_src_port: u16) -> Option<(IpAddr, u16, IpAddr)> {
@@ -1448,6 +1410,37 @@ fn tcp_is_fin_or_rst(data: &[u8]) -> bool {
     }
 }
 
+fn tcp_is_syn(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    match data[0] >> 4 {
+        4 => {
+            if data.len() < 20 || data[9] != 6 {
+                return false;
+            }
+            let ihl = ((data[0] & 0x0F) as usize) * 4;
+            if data.len() < ihl + 14 {
+                return false;
+            }
+            let flags = data[ihl + 13];
+            (flags & 0x02) != 0
+        }
+        6 => {
+            if data.len() < 40 || data[6] != 6 {
+                return false;
+            }
+            let tcp_header_start = 40;
+            if data.len() < tcp_header_start + 14 {
+                return false;
+            }
+            let flags = data[tcp_header_start + 13];
+            (flags & 0x02) != 0
+        }
+        _ => false,
+    }
+}
+
 // ============================================================================
 // PACKET PROCESSING RESULT - Using raw bytes for cross-thread safety
 // ============================================================================
@@ -1469,20 +1462,14 @@ pub struct FirewallEngine {
     pub sdk: Arc<RwLock<super::sdk::SdkRegistry>>,
     pub file_checker: Arc<FileMagicChecker>,
     pub tls_proxy_backend_child: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    pub proxy_listener_alive: Arc<AtomicBool>,
     pub windows_root_trust_ready: Arc<AtomicBool>,
     pub browser_mitm_warning_cache: Arc<Mutex<HashSet<String>>>,
     network_whitelist_index: Arc<RwLock<CidrIndex>>,
-    pub web_filter: Arc<super::web_filter::WebFilter>,
     /// Retained so stop() can call shutdown() and unblock all recv() threads.
     pub divert_handle: Arc<Mutex<Option<WinDivertArc<windivert::prelude::NetworkLayer>>>>,
-    pub flow_divert_handle: Arc<Mutex<Option<WinDivertArc<windivert::prelude::FlowLayer>>>>,
     pub hydranet_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<String>>>>,
     /// Transparent NAT table for WinDivert-based TLS proxy redirection.
     pub nat_table: TransparentNatTable,
-    /// Set once start() has spawned workers and kicked the proxy runtime.
-    /// Lets Start distinguish a live engine from a zombie registration.
-    started: AtomicBool,
 }
 
 // RADICAL REFACTOR: Wrapper to make WinDivert Send + Sync (Safe for WinDivert handles)
@@ -1514,31 +1501,13 @@ impl FirewallEngine {
         // We do NOT hardcode them here to allow user to override/remove them.
 
         let network_whitelist_index = Arc::new(RwLock::new(CidrIndex::from_cidrs(&[])));
-        let web_filter = Arc::new(super::web_filter::WebFilter::load_default());
-        let initial_decisions = Self::load_persisted_decisions();
-        let app_manager = Arc::new(AppManager::new(initial_decisions));
+        let app_manager = Arc::new(AppManager::new(HashMap::new()));
         let settings = Arc::new(RwLock::new(settings_data));
         let sdk = Arc::new(RwLock::new(super::sdk::SdkRegistry::with_defaults()));
-
-        // Sync monitored sites loaded from monitored_sites.yaml / rules.yaml into proxy config
-        {
-            let sdk_guard = sdk.read().unwrap();
-            if !sdk_guard.monitored_sites.is_empty() {
-                let mut s_guard = settings.write().unwrap();
-                for site in &sdk_guard.monitored_sites {
-                    if !s_guard.tls_proxy.monitored_hosts.contains(site) {
-                        s_guard.tls_proxy.monitored_hosts.push(site.clone());
-                    }
-                }
-            }
-        }
-
         let tls_proxy_backend_child = Arc::new(Mutex::new(None));
-        let proxy_listener_alive = Arc::new(AtomicBool::new(false));
         let windows_root_trust_ready = Arc::new(AtomicBool::new(false));
         let browser_mitm_warning_cache = Arc::new(Mutex::new(HashSet::new()));
         let divert_handle = Arc::new(Mutex::new(None));
-        let flow_divert_handle = Arc::new(Mutex::new(None));
         let hydranet_tx = Arc::new(Mutex::new(None));
         let nat_table = TransparentNatTable::new();
 
@@ -1546,181 +1515,41 @@ impl FirewallEngine {
             stats,
             dns_handler,
             app_manager,
-            web_filter,
             settings,
             stop_signal,
             sdk,
             file_checker,
             tls_proxy_backend_child,
-            proxy_listener_alive,
             windows_root_trust_ready,
             browser_mitm_warning_cache,
             network_whitelist_index,
             divert_handle,
-            flow_divert_handle,
             hydranet_tx,
             nat_table,
-            started: AtomicBool::new(false),
         }
     }
 
-    /// True once start() has spawned workers and kicked the proxy runtime.
-    pub(crate) fn is_started(&self) -> bool {
-        self.started.load(Ordering::SeqCst)
-    }
-
-    pub fn load_persisted_decisions() -> HashMap<String, AppDecision> {
-        let mut map = HashMap::new();
-
-        // Baseline immutable OS & EDR components (Default Allowed to protect internet connectivity)
-        map.insert("system".to_string(), AppDecision::Allow);
-        map.insert(r"c:\windows\system32\svchost.exe".to_string(), AppDecision::Allow);
-        map.insert(r"c:\windows\syswow64\svchost.exe".to_string(), AppDecision::Allow);
-        map.insert(r"c:\windows\system32\webviewhost.exe".to_string(), AppDecision::Allow);
-        map.insert(r"c:\windows\explorer.exe".to_string(), AppDecision::Allow);
-        map.insert(r"c:\program files\hydradragonantivirus\openedr\edrsvc.exe".to_string(), AppDecision::Allow);
-        map.insert(r"c:\program files\hydradragonantivirus\openedr\edrgui.exe".to_string(), AppDecision::Allow);
-
-        let rules_path = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_rules.json");
-        let settings_path = Self::pdata_settings_path();
-        let local_settings_list = Self::template_candidates();
-
-        // Helper to ingest decisions from JSON files
-        let mut try_load_file = |path: &PathBuf| {
-            if let Ok(content) = fs::read_to_string(path) {
-                // Try 1: Full JSON structure with "app_decisions": { "path": "Allow" }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(decisions_obj) = v.get("app_decisions").and_then(|d| d.as_object()) {
-                        for (app_key, dec_val) in decisions_obj {
-                            if let Some(act) = dec_val.as_str() {
-                                let dec = match act {
-                                    "Allow" | "allow" | "allow_always" => AppDecision::Allow,
-                                    "AllowOnce" | "allow_once" => AppDecision::AllowOnce,
-                                    "Block" | "block" | "quarantine" => AppDecision::Block,
-                                    _ => AppDecision::Allow,
-                                };
-                                map.insert(app_key.to_lowercase(), dec);
-                            }
-                        }
-                    }
-                }
-                // Try 2: Line-by-line JSON format {"action":"allow","path":"..."}
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                        if let (Some(action), Some(p)) = (
-                            v.get("action").and_then(|s| s.as_str()),
-                            v.get("path").and_then(|s| s.as_str()),
-                        ) {
-                            let dec = match action {
-                                "allow_always" | "allow" | "Allow" => AppDecision::Allow,
-                                "allow_once" | "AllowOnce" => AppDecision::AllowOnce,
-                                "block" | "quarantine" | "Block" => AppDecision::Block,
-                                _ => AppDecision::Allow,
-                            };
-                            map.insert(p.to_lowercase(), dec);
-                        }
-                    }
-                }
-            }
-        };
-
-        for local_settings in &local_settings_list {
-            try_load_file(local_settings);
-        }
-        try_load_file(&settings_path);
-        try_load_file(&rules_path);
-
-        map
-    }
-
-    fn pdata_settings_path() -> PathBuf {
-        PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json")
-    }
-
-    /// All locations where the shipped "json/settings.json" template may live.
-    /// Order matters: exe directory first (service install), then the canonical
-    /// Program Files path, then the CWD-relative path (dev runs).
-    /// A bare relative path alone breaks when running as a Windows service
-    /// because the service CWD is System32, not the install dir.
-    fn template_candidates() -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                out.push(dir.join("json").join("settings.json"));
-            }
-        }
-        out.push(PathBuf::from(
-            r"C:\Program Files\HydraDragonAntivirus\OpenEDR\json\settings.json",
-        ));
-        out.push(PathBuf::from("json/settings.json"));
-        // Deduplicate while preserving order.
-        let mut seen = HashSet::new();
-        out.into_iter()
-            .filter(|p| seen.insert(p.clone()))
-            .collect()
+    pub fn settings_path() -> PathBuf {
+        PathBuf::from("json/settings.json")
     }
 
     pub fn load_settings() -> Option<FirewallSettings> {
-        let pdata = Self::pdata_settings_path();
-        // 1. PRIORITY: template in Program Files / exe directory.
-        //    If it exists and is valid JSON, read it, copy its contents
-        //    verbatim to ProgramData (overwrite), and load it into memory.
-        //    Never invent defaults here, never read the stale ProgramData file.
-        for template in Self::template_candidates() {
-            let Ok(template_content) = fs::read_to_string(&template) else {
-                continue;
-            };
-            match serde_json::from_str::<FirewallSettings>(&template_content) {
-                Ok(settings) => {
-                    Self::ensure_pdata_settings(&template_content);
+        let path = Self::settings_path();
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(settings) = serde_json::from_str::<FirewallSettings>(&content) {
                     return Some(settings);
                 }
-                Err(e) => {
-                    // Template exists but is not valid JSON: do not overwrite
-                    // ProgramData; keep looking / fall through to fallback.
-                    eprintln!(
-                        "[firewall] ignoring invalid template {}: {e}",
-                        template.display()
-                    );
-                }
             }
         }
-        // 2. FALLBACK: only if no template was found / valid,
-        //    look at the ProgramData file.
-        if let Ok(content) = fs::read_to_string(&pdata) {
-            if let Ok(settings) = serde_json::from_str::<FirewallSettings>(&content) {
-                return Some(settings);
-            }
-        }
-        // 3. Last resort: produce a default (in memory only, no disk write).
-        Some(FirewallSettings::default())
-    }
 
-    /// Copies the verified contents of the "json/settings.json" template
-    /// verbatim to "C:\ProgramData\edrsvc\firewall_settings.json" (overwrite).
-    /// Never generates default settings, never reads the existing ProgramData
-    /// file. `template_content` must have been validated as proper JSON beforehand.
-    fn ensure_pdata_settings(template_content: &str) {
-        let pdata = Self::pdata_settings_path();
-        if let Some(parent) = pdata.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!(
-                    "[firewall] failed to create ProgramData dir {}: {e}",
-                    parent.display()
-                );
-                return;
-            }
+        // Create and save settings.json directly with default settings if it doesn't exist
+        let default_settings = FirewallSettings::default();
+        if let Ok(json_str) = serde_json::to_string_pretty(&default_settings) {
+            let _ = fs::create_dir_all("json");
+            let _ = fs::write(&path, json_str);
         }
-        if let Err(e) = fs::write(&pdata, template_content) {
-            eprintln!(
-                "[firewall] failed to copy template to {}: {e}",
-                pdata.display()
-            );
-        }
+        Some(default_settings)
     }
 
     pub fn apply_settings(&self, new_settings: FirewallSettings) {
@@ -1820,55 +1649,24 @@ impl FirewallEngine {
         })
     }
 
-    /// Evaluates whether an outbound connection to port 443 should be intercepted by the TLS proxy.
-    /// Returns false if host is bypassed or pinned.
-    /// When mitm_all_traffic is false, ONLY targets matching monitored_hosts (or SDK rules/monitored_sites)
-    /// are intercepted; all other traffic bypasses the proxy with zero overhead.
-    /// NOTE: "false" mode still steers SDK-matched domains, so it is NOT a
-    /// global no-touch switch — use the returned reason (see below) to audit.
-    fn should_proxy_intercept(
-        tls_proxy: &TlsProxyConfig,
-        hostname: Option<&str>,
-        full_url: Option<&str>,
-        sdk: &super::sdk::SdkRegistry,
-    ) -> bool {
-        Self::intercept_reason(tls_proxy, hostname, full_url, sdk).is_some()
-    }
-
-    /// Same verdict as [`Self::should_proxy_intercept`], but names the cause
-    /// ("mitm_all_traffic", "monitored_hosts:<pattern>", "sdk:<match>") so
-    /// every steering decision can be audited in logs. None == bypass/direct.
-    fn intercept_reason(
-        tls_proxy: &TlsProxyConfig,
-        hostname: Option<&str>,
-        full_url: Option<&str>,
-        sdk: &super::sdk::SdkRegistry,
-    ) -> Option<String> {
-        // 1. Dynamic fallback cache & explicit user bypass hosts
-        if Self::proxy_bypass_matches_target(tls_proxy, hostname, full_url, None) {
-            return None;
-        }
-
-        // 2. Full interception mode
-        if tls_proxy.mitm_all_traffic {
-            return Some("mitm_all_traffic".to_string());
-        }
-
-        // 3. Targeted mode: check against monitored_hosts and SDK monitored_sites
-        let Some(target) = Self::select_proxy_bypass_target(hostname, full_url, None) else {
-            return None;
+    fn wait_for_proxy_listener(addr: std::net::SocketAddr, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let test_addr = if addr.ip().is_unspecified() || addr.ip().is_loopback() {
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                addr.port(),
+            )
+        } else {
+            addr
         };
-
-        if let Some(entry) = tls_proxy.monitored_hosts.iter().find(|entry| {
-            Self::normalize_proxy_bypass_entry(entry).is_some_and(|normalized| {
-                Self::proxy_bypass_entry_matches_target(&normalized, &target)
-            })
-        }) {
-            return Some(format!("monitored_hosts:{entry}"));
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect_timeout(&test_addr, Duration::from_millis(250)).is_ok()
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-
-        sdk.monitored_site_match(&target)
-            .map(|m| format!("sdk:{m}"))
+        false
     }
 
     pub fn sync_proxy_runtime(&self) {
@@ -1891,59 +1689,10 @@ impl FirewallEngine {
 
     pub fn save_settings(&self) {
         let current_settings = self.settings.read().unwrap().clone();
-
-        let settings = FirewallSettings {
-            kernel_block_paths: current_settings.kernel_block_paths.clone(),
-            default_deny: current_settings.default_deny,
-            late_blocking_mode: current_settings.late_blocking_mode,
-            headless_mode: current_settings.headless_mode,
-            log_mode: current_settings.log_mode,
-            show_blocked_logs_only: current_settings.show_blocked_logs_only,
-            show_blocked_graphics_only: current_settings.show_blocked_graphics_only,
-            show_blocked_http_inspector_only: current_settings.show_blocked_http_inspector_only,
-            no_alert_mode: current_settings.no_alert_mode,
-            save_all_logs: current_settings.save_all_logs,
-            prune_old_logs: current_settings.prune_old_logs,
-            max_visible_logs: current_settings.max_visible_logs,
-            prune_http_history: current_settings.prune_http_history,
-            max_visible_http_events: current_settings.max_visible_http_events,
-            log_full_bodies: current_settings.log_full_bodies,
-            tls_proxy: current_settings.tls_proxy.clone(),
-            metadata: current_settings.metadata.clone(),
-        };
-
-        if let Ok(content) = serde_json::to_string_pretty(&settings) {
-            // Keep both files in sync: ProgramData and the local template.
-            // Write to ProgramData plus every known template location so the
-            // install-dir copy and the dev-relative copy stay identical.
-            let pdata = Self::pdata_settings_path();
-            if let Some(parent) = pdata.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    eprintln!(
-                        "[firewall] save_settings: failed to create {}: {e}",
-                        parent.display()
-                    );
-                }
-            }
-            if let Err(e) = fs::write(&pdata, &content) {
-                eprintln!(
-                    "[firewall] save_settings: failed to write {}: {e}",
-                    pdata.display()
-                );
-            }
-            for template in Self::template_candidates() {
-                if let Some(parent) = template.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                }
-                if let Err(e) = fs::write(&template, &content) {
-                    eprintln!(
-                        "[firewall] save_settings: failed to write {}: {e}",
-                        template.display()
-                    );
-                }
-            }
+        if let Ok(json_str) = serde_json::to_string_pretty(&current_settings) {
+            let path = Self::settings_path();
+            let _ = fs::create_dir_all("json");
+            let _ = fs::write(&path, json_str);
         }
     }
 
@@ -2001,19 +1750,15 @@ impl FirewallEngine {
             return;
         }
 
-        // Block QUIC/UDP:443 ONLY when full MITM is explicitly enabled across all traffic.
-        // Default mode is targeted; blocking QUIC globally breaks YouTube, Google, and Chrome.
+        // Only block QUIC (UDP/443) if explicitly configured in settings.json.
+        // Default in settings.json is false (never block) so browsers don't encounter ERR_TIMED_OUT.
         if matches!(info.protocol, Protocol::UDP)
             && info.dst_port == 443
             && tls_proxy.block_quic_udp_443
-            && tls_proxy.mitm_all_traffic
         {
             *should_forward = false;
-            // Always override reason — get_or_insert_with would silently retain a
-            // stale "App Allowed: <name>" reason from the app-decision step and
-            // make firewall activity logs misleading.
             *reason = Some(
-                "Transparent TLS Proxy mode: blocked QUIC (UDP/443); the local proxy handles TCP only"
+                "Transparent TLS Proxy mode: blocked QUIC (UDP/443) as configured in settings.json; the local proxy handles TCP only"
                     .to_string(),
             );
         }
@@ -2042,16 +1787,15 @@ impl FirewallEngine {
         info: &PacketInfo,
         tls_proxy: &TlsProxyConfig,
         browser_mitm_warning_cache: &Arc<Mutex<HashSet<String>>>,
-        sdk: &super::sdk::SdkRegistry,
     ) {
-        let Some(why) = Self::intercept_reason(
+        if Self::proxy_bypass_matches_target(
             tls_proxy,
             info.hostname.as_deref(),
             info.full_url.as_deref(),
-            sdk,
-        ) else {
+            None,
+        ) {
             return;
-        };
+        }
 
         let host_label = info
             .hostname
@@ -2081,13 +1825,12 @@ impl FirewallEngine {
             timestamp: now,
             level: LogLevel::Info,
             message: format!(
-                "Proxy Intercept: {} (pid={}) -> {}:{} via transparent TLS proxy {} ({})",
+                "Proxy Intercept: {} (pid={}) -> {}:{} via transparent TLS proxy {}",
                 app_info.name,
                 info.process_id,
                 host_label,
                 info.dst_port,
-                Self::proxy_addr_string(tls_proxy),
-                why
+                Self::proxy_addr_string(tls_proxy)
             ),
         });
     }
@@ -2098,9 +1841,7 @@ impl FirewallEngine {
         }
 
         // Already running?
-        if self.tls_proxy_backend_child.lock().unwrap().is_some()
-            || self.proxy_listener_alive.load(Ordering::SeqCst)
-        {
+        if self.tls_proxy_backend_child.lock().unwrap().is_some() {
             return;
         }
 
@@ -2137,7 +1878,14 @@ impl FirewallEngine {
             });
         }
 
-        // Generate CA FIRST before creating stop channels or marking anything as running!
+        let (stop_tx_main, stop_rx_main) = oneshot::channel::<()>();
+
+        *self.tls_proxy_backend_child.lock().unwrap() = Some(stop_tx_main);
+        self.browser_mitm_warning_cache.lock().unwrap().clear();
+
+        let sdk = self.sdk.clone();
+        let settings = self.settings.clone();
+
         let Ok(ca_bundle) = super::proxy::generate_ca() else {
             let now = Self::now_ts();
             emit_log_event(LogEntry {
@@ -2150,48 +1898,26 @@ impl FirewallEngine {
             });
             return;
         };
-
-        let (stop_tx_main, stop_rx_main) = oneshot::channel::<()>();
-
-        *self.tls_proxy_backend_child.lock().unwrap() = Some(stop_tx_main);
-        self.browser_mitm_warning_cache.lock().unwrap().clear();
-
-        let sdk = self.sdk.clone();
-        let settings = self.settings.clone();
-
         super::headless::spawn(super::proxy::run_proxy(
             addr_v4,
             ca_bundle.issuer,
             sdk,
             settings,
-            self.web_filter.clone(),
-            self.proxy_listener_alive.clone(),
             stop_rx_main,
         ));
 
         let proxy_runtime = self.tls_proxy_backend_child.clone();
-        let proxy_alive = self.proxy_listener_alive.clone();
         std::thread::Builder::new()
             .name("proxy_ready_waiter".to_string())
             .spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while std::time::Instant::now() < deadline {
-                    if proxy_alive.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    if proxy_runtime.lock().unwrap().is_none() {
-                        // Proxy was stopped externally (stop_embedded_proxy):
-                        // exit quietly, there is nothing to report.
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
+                let listener_ready = Self::wait_for_proxy_listener(addr_v4, Duration::from_secs(5));
+                let still_running = proxy_runtime.lock().unwrap().is_some();
+                if !still_running {
+                    return;
                 }
 
-                let still_running = proxy_runtime.lock().unwrap().is_some();
-                let is_alive = proxy_alive.load(Ordering::SeqCst);
                 let now = Self::now_ts();
-
-                if is_alive && still_running {
+                if listener_ready {
                     emit_log_event(LogEntry {
                         id: format!("{}-proxy-ready", now),
                         timestamp: now,
@@ -2201,19 +1927,13 @@ impl FirewallEngine {
                             addr_string
                         ),
                     });
-                } else if still_running {
-                    // NEVER kill the proxy here. The waiter is observe-only:
-                    // taking the stop channel would drop stop_tx_main, fire
-                    // stop_rx in run_proxy, and shut down a proxy that may be
-                    // just about to finish binding (self-inflicted outage).
-                    // Log and leave the runtime alone; workers fail open
-                    // (no redirect) until proxy_alive flips true.
+                } else {
                     emit_log_event(LogEntry {
                         id: format!("{}-proxy-not-ready", now),
                         timestamp: now,
                         level: LogLevel::Warning,
                         message: format!(
-                            "Transparent TLS Proxy/Inspector not ready yet on {} - traffic flows direct until the listener comes up",
+                            "Transparent TLS Proxy/Inspector did not become ready on {} - Windows proxy was left disabled to avoid breaking internet access",
                             addr_string
                         ),
                     });
@@ -2223,10 +1943,6 @@ impl FirewallEngine {
     }
 
     fn stop_embedded_proxy(&self) {
-        self.proxy_listener_alive.store(false, Ordering::SeqCst);
-        if let Some(tx) = self.tls_proxy_backend_child.lock().unwrap().take() {
-            let _ = tx.send(());
-        }
         self.browser_mitm_warning_cache.lock().unwrap().clear();
     }
 
@@ -2759,42 +2475,6 @@ impl FirewallEngine {
                         }
                     }
                 }
-
-                // TCP IPv6 lookup fallback
-                let mut size6: u32 = 0;
-                let _ = windows::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable(
-                    None,
-                    &mut size6,
-                    false,
-                    windows::Win32::Networking::WinSock::AF_INET6.0 as u32,
-                    windows::Win32::NetworkManagement::IpHelper::TCP_TABLE_OWNER_PID_ALL,
-                    0,
-                );
-
-                if size6 > 0 {
-                    let mut buffer6 = vec![0u8; size6 as usize];
-                    if windows::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable(
-                        Some(buffer6.as_mut_ptr() as *mut _),
-                        &mut size6,
-                        false,
-                        windows::Win32::Networking::WinSock::AF_INET6.0 as u32,
-                        windows::Win32::NetworkManagement::IpHelper::TCP_TABLE_OWNER_PID_ALL,
-                        0,
-                    ) == 0
-                    {
-                        let table = buffer6.as_ptr() as *const windows::Win32::NetworkManagement::IpHelper::MIB_TCP6TABLE_OWNER_PID;
-                        let num_entries = (*table).dwNumEntries as usize;
-                        let entries =
-                            std::slice::from_raw_parts((*table).table.as_ptr(), num_entries);
-
-                        for entry in entries {
-                            let local_port = u16::from_be(entry.dwLocalPort as u16);
-                            if local_port == port {
-                                return entry.dwOwningPid;
-                            }
-                        }
-                    }
-                }
             } else {
                 // UDP lookup
                 let mut size: u32 = 0;
@@ -2831,42 +2511,6 @@ impl FirewallEngine {
                         }
                     }
                 }
-
-                // UDP IPv6 lookup fallback
-                let mut size6: u32 = 0;
-                let _ = windows::Win32::NetworkManagement::IpHelper::GetExtendedUdpTable(
-                    None,
-                    &mut size6,
-                    false,
-                    windows::Win32::Networking::WinSock::AF_INET6.0 as u32,
-                    windows::Win32::NetworkManagement::IpHelper::UDP_TABLE_OWNER_PID,
-                    0,
-                );
-
-                if size6 > 0 {
-                    let mut buffer6 = vec![0u8; size6 as usize];
-                    if windows::Win32::NetworkManagement::IpHelper::GetExtendedUdpTable(
-                        Some(buffer6.as_mut_ptr() as *mut _),
-                        &mut size6,
-                        false,
-                        windows::Win32::Networking::WinSock::AF_INET6.0 as u32,
-                        windows::Win32::NetworkManagement::IpHelper::UDP_TABLE_OWNER_PID,
-                        0,
-                    ) == 0
-                    {
-                        let table = buffer6.as_ptr() as *const windows::Win32::NetworkManagement::IpHelper::MIB_UDP6TABLE_OWNER_PID;
-                        let num_entries = (*table).dwNumEntries as usize;
-                        let entries =
-                            std::slice::from_raw_parts((*table).table.as_ptr(), num_entries);
-
-                        for entry in entries {
-                            let local_port = u16::from_be(entry.dwLocalPort as u16);
-                            if local_port == port {
-                                return entry.dwOwningPid;
-                            }
-                        }
-                    }
-                }
             }
         }
         0 // Not found
@@ -2889,12 +2533,15 @@ impl FirewallEngine {
         // not via WinDivert, so we don't need to compete with another WinDivert handle.
         // Priority 0 is fine.
         let divert_priority: i16 = 0;
-        let filter = "true";
+        // KERNEL FILTER OPTIMIZATION:
+        // Only intercept non-loopback packets, OR loopback packets destined to/from the TLS proxy (port 8877).
+        // All other Windows internal loopback IPC/RPC/database traffic bypasses user-space entirely in kernel.
+        let filter = "!loopback || tcp.DstPort == 8877 || tcp.SrcPort == 8877";
         let divert = match WinDivert::network(filter, divert_priority, WinDivertFlags::new()) {
             Ok(d) => {
                 let _ = d.set_param(WinDivertParam::QueueLength, 32768);
-                let _ = d.set_param(WinDivertParam::QueueTime, 8000);
-                let _ = d.set_param(WinDivertParam::QueueSize, 32 * 1024 * 1024);
+                let _ = d.set_param(WinDivertParam::QueueSize, 134217728);
+                let _ = d.set_param(WinDivertParam::QueueTime, 4000);
                 WinDivertArc(Arc::new(d))
             }
             Err(e) => {
@@ -2956,6 +2603,7 @@ impl FirewallEngine {
                         .into(),
             });
         }
+        self.sync_proxy_runtime();
 
         // ── NETWORK EVENT PIPE WRITER ────────────────────────────────────────────
         // Sends real network I/O events to the AV behavior engine so it can track
@@ -2992,50 +2640,8 @@ impl FirewallEngine {
                 .expect("failed to spawn net_event_telemetry_writer thread");
         }
 
-        // WinDivert FLOW Layer Tracker:
-        // Captures flow creation events directly from Windows kernel via WinDivert FLOW layer.
-        // Immediately records local_port -> PID mappings so packet workers resolve PIDs in O(1).
-        {
-            let am_flow = Arc::clone(&am);
-            let stop_flow = Arc::clone(&stop);
-            let flow_divert_handle = Arc::clone(&self.flow_divert_handle);
-            std::thread::Builder::new()
-                .name("windivert_flow_tracker".to_string())
-                .spawn(move || {
-                    if let Ok(flow_divert) = WinDivert::flow("true", 0, WinDivertFlags::new()) {
-                        let flow_arc = WinDivertArc(Arc::new(flow_divert));
-                        *flow_divert_handle.lock().unwrap() = Some(flow_arc.clone());
-                        let mut flow_buf = [0u8; 1024];
-                        while !stop_flow.load(Ordering::Relaxed) {
-                            match flow_arc.0.recv(Some(&mut flow_buf)) {
-                                Ok(flow_packet) => {
-                                    let pid = flow_packet.address.process_id();
-                                    let local_port = flow_packet.address.local_port();
-                                    if pid != 0 && local_port != 0 {
-                                        am_flow.update_port_mapping(local_port, pid);
-                                    }
-                                }
-                                Err(_) => {
-                                    if stop_flow.load(Ordering::Relaxed) {
-                                        break;
-                                    }
-                                    std::thread::sleep(Duration::from_millis(5));
-                                }
-                            }
-                        }
-                    }
-                })
-                .expect("failed to spawn windivert_flow_tracker thread");
-        }
-
-        // Start the proxy listener BEFORE packet workers, so 127.0.0.1:<port>
-        // is already accepting by the time workers can redirect to it.
-        // (Binding is async, so the proxy_alive gate in the workers still
-        // covers the residual race: unready proxy => traffic flows direct.)
-        self.sync_proxy_runtime();
-
-        // Worker Pool - 8 workers for parallel packet processing (matching original firewall GUI engine)
-        let num_workers = 8;
+        // Worker Pool - RADICAL REFACTOR: Each worker is a fully independent capture loop
+        let num_workers = 8; // Increased workers for parallel processing
         for worker_id in 0..num_workers {
             let stats_w = Arc::clone(&stats);
             let am_w = Arc::clone(&am);
@@ -3046,24 +2652,20 @@ impl FirewallEngine {
             let fcheck_w = Arc::clone(&self.file_checker);
             let browser_mitm_warning_cache_w = Arc::clone(&self.browser_mitm_warning_cache);
             let network_whitelist_index_w = Arc::clone(&self.network_whitelist_index);
-            let web_filter_w = Arc::clone(&self.web_filter);
             let divert_w = divert.clone();
             let net_ev_tx = net_event_tx.clone();
             let nat_table_w = self.nat_table.clone();
-            let proxy_alive_w = Arc::clone(&self.proxy_listener_alive);
 
             std::thread::Builder::new()
                 .name(format!("packet_worker_{}", worker_id))
                 .spawn(move || {
                     let mut buffer = vec![0u8; 65535];
-                    let mut packet_count = 0u64;
                     // Per-worker dedup: only send one NET_EVENT per PID per session
                     let mut notified_pids: HashSet<u32> = HashSet::new();
                     while !stop_w.load(Ordering::Relaxed) {
                         // Each thread competition for packets on the shared handle
                         match divert_w.recv(Some(&mut buffer)) {
                             Ok(packet) => {
-                                packet_count += 1;
                                 let outbound = packet.address.outbound();
 
                                 // Skip packets reinjected by the embedded proxy (or any other
@@ -3095,9 +2697,8 @@ impl FirewallEngine {
                                 // NetworkLayer addresses do NOT carry process_id;
                                 // start at 0 and resolve via TCP/UDP table below.
                                 let mut pid: u32 = 0;
-                                let data_vec = packet.data.to_vec();
                                 let mut pre_parsed =
-                                    Self::parse_packet(&data_vec, outbound, 0, &am_w.info_cache);
+                                    Self::parse_packet(&packet.data, outbound, 0, &am_w.info_cache);
 
                                 if let Some((ref mut p_info, _)) = pre_parsed {
                                     let lookup_port = if outbound {
@@ -3108,352 +2709,239 @@ impl FirewallEngine {
                                     let is_tcp =
                                         matches!(p_info.protocol, super::engine::Protocol::TCP);
 
-                                    // 1. Fast cache lookup: check mapped ports first (O(1), zero syscalls)
-                                    if pid == 0 {
-                                        if let Some(cached_pid) = am_w.get_pid_for_port(lookup_port) {
-                                            pid = cached_pid;
+                                    // 1. Check in-memory port-to-PID mapping first (<5ns, zero OS syscalls)
+                                    if let Some(mapped_pid) = am_w.get_pid_for_port(lookup_port) {
+                                        pid = mapped_pid;
+                                    } else {
+                                        // Only query Windows TCP/UDP table on connection setup (SYN) or DNS to prevent queue freezing during bulk data flow
+                                        let is_syn = is_tcp && tcp_is_syn(&packet.data);
+                                        let is_dns = lookup_port == 53;
+                                        if is_syn || is_dns {
+                                            pid = Self::resolve_pid_from_port(lookup_port, is_tcp);
+                                            am_w.update_port_mapping(lookup_port, pid);
                                         }
                                     }
 
-                                    // 2. Fall through to Windows extended TCP/UDP table only for outbound traffic (matching connection origin)
-                                    if pid == 0 && outbound {
-                                        pid = Self::resolve_pid_from_port(lookup_port, is_tcp);
-                                    }
-
-                                    // Cache the resolved port->PID mapping for future
                                     if pid != 0 {
-                                        am_w.update_port_mapping(lookup_port, pid);
                                         p_info.process_id = pid;
                                         p_info.image_path = am_w.info_cache.get_info(pid).path;
                                     }
                                 }
 
-                                let worker_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    let decision = Self::process_packet_decision(
-                                        &packet.data,
-                                        &addr_bytes,
-                                        outbound,
-                                        &stats_w,
-                                        &am_w,
-                                        &settings_w,
-                                        &dns_w,
-                                        &sdk_w,
-                                        &fcheck_w,
-                                        pid,
-                                        &pre_parsed,
-                                        &browser_mitm_warning_cache_w,
-                                        &network_whitelist_index_w,
-                                        &web_filter_w,
-                                    );
+                                let decision = Self::process_packet_decision(
+                                    &packet.data,
+                                    &addr_bytes,
+                                    outbound,
+                                    &stats_w,
+                                    &am_w,
+                                    &settings_w,
+                                    &dns_w,
+                                    &sdk_w,
+                                    &fcheck_w,
+                                    pid,
+                                    &pre_parsed,
+                                    &browser_mitm_warning_cache_w,
+                                    &network_whitelist_index_w,
+                                );
 
-                                    // Firewall activity telemetry. Network blocks stay in the
-                                    // firewall; they must not become Owlyshield process-kill alerts.
-                                    let mut decision_info: Option<PacketInfo> = None;
-                                    if let Some((ref p_info, _)) = pre_parsed {
-                                        decision_info = Some(p_info.clone());
-                                    }
+                                // Firewall activity telemetry. Network blocks stay in the
+                                // firewall; they must not become Owlyshield process-kill alerts.
+                                let mut decision_info: Option<PacketInfo> = None;
+                                if let Some((ref p_info, _)) = pre_parsed {
+                                    decision_info = Some(p_info.clone());
+                                }
 
-                                    if outbound && pid != 0 {
-                                        if let Some(ref parsed_info) = decision_info {
-                                            // NET_EVENT records observed network activity only.
-                                            if !notified_pids.contains(&pid) {
-                                                let msg = format!(
-                                                    "NET_EVENT:{}:{}:{}\n",
-                                                    pid, parsed_info.dst_ip, parsed_info.dst_port
-                                                );
-                                                let _ = net_ev_tx.send(msg);
-                                                notified_pids.insert(pid);
-                                            }
+                                if outbound && pid != 0 {
+                                    if let Some(ref parsed_info) = decision_info {
+                                        // NET_EVENT records observed network activity only.
+                                        if !notified_pids.contains(&pid) {
+                                            let msg = format!(
+                                                "NET_EVENT:{}:{}:{}\n",
+                                                pid, parsed_info.dst_ip, parsed_info.dst_port
+                                            );
+                                            let _ = net_ev_tx.send(msg);
+                                            notified_pids.insert(pid);
                                         }
                                     }
+                                }
 
-                                    if decision.should_forward {
-                                        let mut packet_data = decision.packet_data;
-                                        let mut recalc_checksums = decision.recalc_checksums;
-                                        let mut loopback_flag = None;
-                                        let mut outbound_flag = None;
+                                if decision.should_forward {
+                                    let mut packet_data = decision.packet_data;
+                                    let mut recalc_checksums = decision.recalc_checksums;
+                                    let mut loopback_flag = None;
 
-                                        let tls_proxy_cfg =
-                                            settings_w.read().unwrap().tls_proxy.clone();
-                                        let proxy_alive = proxy_alive_w.load(Ordering::SeqCst);
+                                    let tls_proxy_cfg =
+                                        settings_w.read().unwrap().tls_proxy.clone();
+                                    // CRITICAL FIX: Only redirect to proxy if it's actually enabled AND auto-started
+                                    if tls_proxy_cfg.mode == TlsInspectionMode::TlsProxy
+                                        && tls_proxy_cfg.auto_start
+                                    {
+                                        let mut is_tcp = false;
+                                        let mut src_port = 0;
+                                        let mut dst_port = 0;
+                                        let mut src_ip = None;
+                                        let mut dst_ip = None;
+                                        if let Some((ref p_info, _)) = pre_parsed {
+                                            is_tcp = matches!(
+                                                p_info.protocol,
+                                                super::engine::Protocol::TCP
+                                            );
+                                            src_port = p_info.src_port;
+                                            dst_port = p_info.dst_port;
+                                            src_ip = Some(p_info.src_ip);
+                                            dst_ip = Some(p_info.dst_ip);
+                                        }
 
-                                        if tls_proxy_cfg.mode == TlsInspectionMode::TlsProxy
-                                            && tls_proxy_cfg.auto_start
-                                            && proxy_alive
-                                        {
-                                            let mut is_tcp = false;
-                                            let mut src_port = 0;
-                                            let mut dst_port = 0;
-                                            let mut src_ip = None;
-                                            let mut dst_ip = None;
-                                            let mut p_hostname: Option<&str> = None;
-                                            let mut p_full_url: Option<&str> = None;
-                                            if let Some((ref p_info, _)) = pre_parsed {
-                                                is_tcp = matches!(
-                                                    p_info.protocol,
-                                                    super::engine::Protocol::TCP
-                                                );
-                                                src_port = p_info.src_port;
-                                                dst_port = p_info.dst_port;
-                                                src_ip = Some(p_info.src_ip);
-                                                dst_ip = Some(p_info.dst_ip);
-                                                p_hostname = p_info.hostname.as_deref();
-                                                p_full_url = p_info.full_url.as_deref();
-                                            }
+                                        if is_tcp {
+                                            let proxy_return_flow = src_ip
+                                                .is_some_and(Self::is_loopback)
+                                                && src_port == tls_proxy_cfg.listen_port;
 
-                                            if is_tcp {
-                                                let proxy_return_flow = src_ip
-                                                    .is_some_and(Self::is_loopback)
-                                                    && src_port == tls_proxy_cfg.listen_port;
-
-                                                if proxy_return_flow {
-                                                    if let Some((orig_ip, orig_port, orig_src)) =
-                                                        nat_table_w.get(dst_port)
-                                                    {
-                                                        let ok = match orig_ip {
-                                                            IpAddr::V4(v4) => {
-                                                                let ok_src = nat_rewrite_src_ipv4(
-                                                                    &mut packet_data,
-                                                                    v4,
-                                                                    orig_port,
-                                                                );
-                                                                let ok_dst =
-                                                                    if let IpAddr::V4(orig_client_ip) =
-                                                                        orig_src
-                                                                    {
-                                                                        nat_rewrite_dst_ipv4(
-                                                                            &mut packet_data,
-                                                                            orig_client_ip,
-                                                                            dst_port,
-                                                                        )
-                                                                    } else {
-                                                                        false
-                                                                    };
-                                                                ok_src && ok_dst
-                                                            }
-                                                            IpAddr::V6(v6) => {
-                                                                let ok_src = nat_rewrite_src_ipv6(
-                                                                    &mut packet_data,
-                                                                    v6,
-                                                                    orig_port,
-                                                                );
-                                                                let ok_dst =
-                                                                    if let IpAddr::V6(orig_client_ip) =
-                                                                        orig_src
-                                                                    {
-                                                                        nat_rewrite_dst_ipv6(
-                                                                            &mut packet_data,
-                                                                            orig_client_ip,
-                                                                            dst_port,
-                                                                        )
-                                                                    } else {
-                                                                        false
-                                                                    };
-                                                                ok_src && ok_dst
-                                                            }
-                                                        };
-                                                        if ok {
-                                                            recalc_checksums = true;
-                                                            loopback_flag = Some(false);
-                                                            outbound_flag = Some(false);
-                                                            if tcp_is_fin_or_rst(&packet_data) {
-                                                                nat_table_w.remove(dst_port);
-                                                            }
+                                            if proxy_return_flow {
+                                                if let Some((orig_ip, orig_port, orig_src)) =
+                                                    nat_table_w.get(dst_port)
+                                                {
+                                                    let ok = match orig_ip {
+                                                        IpAddr::V4(v4) => {
+                                                            let ok_src = nat_rewrite_src_ipv4(
+                                                                &mut packet_data,
+                                                                v4,
+                                                                orig_port,
+                                                            );
+                                                            let ok_dst =
+                                                                if let IpAddr::V4(orig_client_ip) =
+                                                                    orig_src
+                                                                {
+                                                                    nat_rewrite_dst_ipv4(
+                                                                        &mut packet_data,
+                                                                        orig_client_ip,
+                                                                        dst_port,
+                                                                    )
+                                                                } else {
+                                                                    false
+                                                                };
+                                                            ok_src && ok_dst
+                                                        }
+                                                        IpAddr::V6(v6) => {
+                                                            let ok_src = nat_rewrite_src_ipv6(
+                                                                &mut packet_data,
+                                                                v6,
+                                                                orig_port,
+                                                            );
+                                                            let ok_dst =
+                                                                if let IpAddr::V6(orig_client_ip) =
+                                                                    orig_src
+                                                                {
+                                                                    nat_rewrite_dst_ipv6(
+                                                                        &mut packet_data,
+                                                                        orig_client_ip,
+                                                                        dst_port,
+                                                                    )
+                                                                } else {
+                                                                    false
+                                                                };
+                                                            ok_src && ok_dst
+                                                        }
+                                                    };
+                                                    if ok {
+                                                        recalc_checksums = true;
+                                                        loopback_flag = Some(false);
+                                                        if tcp_is_fin_or_rst(&packet_data) {
+                                                            nat_table_w.remove(dst_port);
                                                         }
                                                     }
-                                                } else if outbound
-                                                    && dst_port == 443
-                                                    && pid != 0
-                                                    && pid != std::process::id()
-                                                    && !http_mitm_proxy::is_registered_upstream_local_port(src_port)
-                                                    && Self::should_proxy_intercept(
-                                                        &tls_proxy_cfg,
-                                                        p_hostname,
-                                                        p_full_url,
-                                                        &sdk_w.read().unwrap(),
-                                                    )
+                                                }
+                                            } else if outbound
+                                                && dst_port == 443
+                                                && pid != std::process::id()
+                                                && !http_mitm_proxy::is_registered_upstream_local_port(src_port)
+                                            {
+                                                if let (Some(orig_dst), Some(orig_src)) =
+                                                    (dst_ip, src_ip)
                                                 {
-                                                    // SYN-anchor: steer only a NEW SYN or an
-                                                    // already-NATed flow. Hijacking mid-connection
-                                                    // data the proxy never handshook draws an
-                                                    // instant RST (this is also how the proxy's
-                                                    // own upstream handshake with itself — the
-                                                    // 502 "InvalidContentType" self-loop — is cut:
-                                                    // a mid-stream packet is never steered).
-                                                    let is_syn = pre_parsed.as_ref().map_or(false, |(p, _)| {
-                                                        p.tcp_flags.is_some_and(|f| f & 0x02 != 0)
-                                                    });
-                                                    let already_routed =
-                                                        nat_table_w.get(src_port).is_some();
-                                                    // Direct-started flows stay direct.
-                                                    if (is_syn || already_routed)
-                                                        && let (Some(orig_dst), Some(orig_src)) =
-                                                            (dst_ip, src_ip)
+                                                    let is_active_nat_flow = nat_table_w.get(src_port).is_some();
+                                                    let should_intercept = is_active_nat_flow || {
+                                                        let host_resolved = dns_w.resolve_ip(&orig_dst.to_string());
+                                                        let host_candidate = pre_parsed.as_ref()
+                                                            .and_then(|(p, _)| p.hostname.as_deref())
+                                                            .or(host_resolved.as_deref());
+                                                        let sdk_guard = sdk_w.read().unwrap();
+                                                        sdk_guard.has_target_rule(host_candidate, Some(orig_dst))
+                                                    };
+
+                                                    if should_intercept
+                                                        && !Self::is_loopback(orig_dst)
+                                                        && !orig_dst.is_unspecified()
+                                                        && !orig_dst.is_multicast()
                                                     {
-                                                        // Fresh owner check (new SYNs only): the cached
-                                                        // port->pid map may still attribute the proxy's
-                                                        // own brand-new upstream socket to a previous
-                                                        // owner (stale entry) and loop the proxy into
-                                                        // itself (502 "InvalidContentType" self-loop).
-                                                        // A live table read returns 0 for not-yet-
-                                                        // visible sockets (-> direct, safe) and the
-                                                        // true owner otherwise. Already-NATed flows
-                                                        // keep affinity without re-resolving.
-                                                        let owner_ok = already_routed || {
-                                                            let fresh_pid =
-                                                                Self::resolve_pid_from_port(
-                                                                    src_port, true,
-                                                                );
-                                                            fresh_pid != 0
-                                                                && fresh_pid
-                                                                    != std::process::id()
-                                                        };
-                                                        if !Self::is_loopback(orig_dst)
-                                                            && !orig_dst.is_unspecified()
-                                                            && !orig_dst.is_multicast()
-                                                            && orig_dst.is_ipv4()
-                                                            && owner_ok
-                                                        {
+                                                        if !is_active_nat_flow {
                                                             nat_table_w.insert(
                                                                 src_port,
                                                                 (orig_dst, 443, orig_src),
                                                             );
-                                                            let ok = match orig_dst {
-                                                                IpAddr::V4(_v4) => {
-                                                                    let ok_dst = nat_rewrite_dst_ipv4(
-                                                                        &mut packet_data,
-                                                                        Ipv4Addr::new(127, 0, 0, 1),
-                                                                        tls_proxy_cfg.listen_port,
-                                                                    );
-                                                                    let ok_src = nat_rewrite_src_ipv4(
-                                                                        &mut packet_data,
-                                                                        Ipv4Addr::new(127, 0, 0, 1),
-                                                                        src_port,
-                                                                    );
-                                                                    ok_dst && ok_src
-                                                                }
-                                                                _ => false,
-                                                            };
-                                                            if ok {
-                                                                recalc_checksums = true;
-                                                                loopback_flag = Some(true);
-                                                                // Keep outbound=true: local delivery happens on
-                                                                // the outbound/loopback path, exactly like every
-                                                                // working 127.0.0.1 flow (status page loads;
-                                                                // 5890 RPC flows). Clearing outbound misroutes
-                                                                // the packet into the inbound path where no
-                                                                // socket ever answers it (steer logged, proxy
-                                                                // silent, client retransmits). IfIdx is ignored
-                                                                // for outbound injection, so it is left alone.
-                                                                // Audit (SYN only => once per steered flow):
-                                                                // name the exact cause so "false still
-                                                                // touches traffic" cases are traceable
-                                                                // to a rule instead of a mystery.
-                                                                if is_syn {
-                                                                    if let Some(why) =
-                                                                        Self::intercept_reason(
-                                                                            &tls_proxy_cfg,
-                                                                            p_hostname,
-                                                                            p_full_url,
-                                                                            &sdk_w.read().unwrap(),
-                                                                        )
-                                                                    {
-                                                                        let now = Self::now_ts();
-                                                                        let target = p_hostname
-                                                                            .unwrap_or("unknown");
-                                                                        emit_log_event(LogEntry {
-                                                                            id: format!(
-                                                                                "{}-steer",
-                                                                                now
-                                                                            ),
-                                                                            timestamp: now,
-                                                                            level: LogLevel::Info,
-                                                                            message: format!(
-                                                                                "Proxy steer: {}:{} -> 127.0.0.1:{} ({})",
-                                                                                target,
-                                                                                dst_port,
-                                                                                tls_proxy_cfg
-                                                                                    .listen_port,
-                                                                                why
-                                                                            ),
-                                                                        });
-                                                                    }
-                                                                }
-                                                                if tcp_is_fin_or_rst(&packet_data) {
-                                                                    nat_table_w.remove(src_port);
-                                                                }
+                                                        }
+                                                        let ok = match orig_dst {
+                                                            IpAddr::V4(_v4) => {
+                                                                let ok_dst = nat_rewrite_dst_ipv4(
+                                                                    &mut packet_data,
+                                                                    Ipv4Addr::new(127, 0, 0, 1),
+                                                                    tls_proxy_cfg.listen_port,
+                                                                );
+                                                                let ok_src = nat_rewrite_src_ipv4(
+                                                                    &mut packet_data,
+                                                                    Ipv4Addr::new(127, 0, 0, 1),
+                                                                    src_port,
+                                                                );
+                                                                ok_dst && ok_src
+                                                            }
+                                                            IpAddr::V6(_v6) => {
+                                                                let ok_dst = nat_rewrite_dst_ipv6(
+                                                                    &mut packet_data,
+                                                                    std::net::Ipv6Addr::LOCALHOST,
+                                                                    tls_proxy_cfg.listen_port,
+                                                                );
+                                                                let ok_src = nat_rewrite_src_ipv6(
+                                                                    &mut packet_data,
+                                                                    std::net::Ipv6Addr::LOCALHOST,
+                                                                    src_port,
+                                                                );
+                                                                ok_dst && ok_src
+                                                            }
+                                                        };
+                                                        if ok {
+                                                            recalc_checksums = true;
+                                                            loopback_flag = Some(true);
+                                                            if tcp_is_fin_or_rst(&packet_data) {
+                                                                nat_table_w.remove(src_port);
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-
-                                        // REINJECT IMMEDIATELY from the SAME thread
-                                        // Legacy-proven packet reinjection: Always construct WinDivertPacket with cloned address
-                                        let mut reinject_address = packet.address.clone();
-                                        if let Some(val) = loopback_flag {
-                                            reinject_address.as_mut().set_loopback(val);
-                                        }
-                                        if let Some(val) = outbound_flag {
-                                            reinject_address.as_mut().set_outbound(val);
-                                        }
-                                        let mut reinject_packet = windivert::packet::WinDivertPacket {
-                                            address: reinject_address,
-                                            data: std::borrow::Cow::Owned(packet_data),
-                                        };
-                                        if recalc_checksums {
-                                            let _ = reinject_packet
-                                                .recalculate_checksums(Default::default());
-                                        }
-                                        if divert_w.send(&reinject_packet).is_err() {
-                                            // CRITICAL FAIL-OPEN fallback
-                                            if divert_w.send(&packet).is_err() {
-                                                // Both sends failed: the packet is LOST
-                                                // (queue overflow, handle teardown, driver
-                                                // drop). Count it and alarm (5s budget) so
-                                                // silent transport loss is visible instead
-                                                // of a mystery timeout (e.g. dead DNS).
-                                                let lost = stats_w
-                                                    .reinject_failed
-                                                    .fetch_add(1, Ordering::Relaxed)
-                                                    + 1;
-                                                let now = Self::now_ts();
-                                                let last = stats_w
-                                                    .last_reinject_fail_log
-                                                    .load(Ordering::Relaxed);
-                                                if now > last + 5000
-                                                    && stats_w
-                                                        .last_reinject_fail_log
-                                                        .compare_exchange(
-                                                            last,
-                                                            now,
-                                                            Ordering::Relaxed,
-                                                            Ordering::Relaxed,
-                                                        )
-                                                        .is_ok()
-                                                {
-                                                    emit_log_event(LogEntry {
-                                                        id: format!("{}-reinject-fail", now),
-                                                        timestamp: now,
-                                                        level: LogLevel::Error,
-                                                        message: format!(
-                                                            "Transport loss: WinDivert reinject failed (total lost: {})",
-                                                            lost
-                                                        ),
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // Packet is blocked - only if confirmed malicious
                                     }
-                                }));
 
-                                if worker_res.is_err() {
-                                    // CRITICAL FAIL-OPEN GUARD: If any panic occurred in worker logic,
-                                    // immediately reinject raw packet so internet connectivity NEVER drops!
-                                    let _ = divert_w.send(&packet);
+                                    // REINJECT IMMEDIATELY from the SAME thread
+                                    // CRITICAL FIX: Only send if should_forward is true
+                                    let mut reinject_address = packet.address.clone();
+                                    if let Some(val) = loopback_flag {
+                                        reinject_address.as_mut().set_loopback(val);
+                                    }
+                                    let mut reinject_packet = windivert::packet::WinDivertPacket {
+                                        address: reinject_address,
+                                        data: std::borrow::Cow::Owned(packet_data),
+                                    };
+                                    if recalc_checksums {
+                                        let _ = reinject_packet
+                                            .recalculate_checksums(Default::default());
+                                    }
+                                    // Send the packet back to the network stack
+                                    if let Err(_e) = divert_w.send(&reinject_packet) {
+                                        // Log error selectively?
+                                    }
+                                } else {
+                                    // Packet is blocked - we just don't call divert.send()
+                                    // WinDivert drops it automatically since we didn't send it.
                                 }
                             }
                             Err(_e) => {
@@ -3467,15 +2955,12 @@ impl FirewallEngine {
                                 } else {
                                     let ts = Self::now_ts();
                                     emit_log_event(LogEntry {
-                                        id: format!(
-                                            "{}-worker-{}-err-{}",
-                                            ts, worker_id, packet_count
-                                        ),
+                                        id: format!("{}-worker-{}-err", ts, worker_id),
                                         timestamp: ts,
                                         level: LogLevel::Error,
                                         message: format!(
-                                            "Worker {} Recv Error: {} (count: {})",
-                                            worker_id, err_str, packet_count
+                                            "Worker {} Recv Error: {}",
+                                            worker_id, err_str
                                         ),
                                     });
                                     std::thread::sleep(Duration::from_millis(100));
@@ -3486,11 +2971,6 @@ impl FirewallEngine {
                 })
                 .expect("failed to spawn packet worker");
         }
-
-        // Mark started LAST: a registered-but-unstarted engine is a zombie
-        // that blocks future Start calls, so this flag is the liveness proof.
-        // (Proxy was already kicked above, before the workers.)
-        self.started.store(true, Ordering::SeqCst);
     }
 
     fn process_packet_decision(
@@ -3507,7 +2987,6 @@ impl FirewallEngine {
         pre_parsed: &Option<(PacketInfo, usize)>,
         browser_mitm_warning_cache: &Arc<Mutex<HashSet<String>>>,
         network_whitelist_index: &Arc<RwLock<CidrIndex>>,
-        web_filter: &Arc<super::web_filter::WebFilter>,
     ) -> PacketDecision {
         let (mut info, mut payload_offset) = match pre_parsed {
             Some(p) => (p.0.clone(), p.1),
@@ -3573,6 +3052,7 @@ impl FirewallEngine {
             process_path: app_info.path.clone(),
         };
 
+
         // Initialize decision state
         let mut should_forward = true;
         let mut reason: Option<String> = None;
@@ -3602,37 +3082,32 @@ impl FirewallEngine {
             }
         }
 
-        // --- Pure CIDR Blacklist Scan (WebFilter) ---
+        // ── Clean CIDR IP Threat Intelligence Scan ─────────────────────────
+        // Evaluates remote IP against curated CIDR ranges (CIDRBlackListIPv4/v6.txt).
+        // Works in all modes (MetadataOnly, TlsProxy, or direct). Zero false positives.
         let remote_ip = if info.outbound { info.dst_ip } else { info.src_ip };
-        let is_private_or_local = match remote_ip {
-            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_broadcast() || v4.is_unspecified(),
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
-        if !is_private_or_local {
-            let flow_key = (info.src_ip, info.dst_ip, info.dst_port);
-            if let Some(web_match) = web_filter.find_match_cached(flow_key, remote_ip) {
-                stats.packets_total.fetch_add(1, Ordering::Relaxed);
-                stats.packets_blocked.fetch_add(1, Ordering::Relaxed);
+        if let Some(reason_str) = am.threat_intel.check_ip(remote_ip) {
+            stats.packets_total.fetch_add(1, Ordering::Relaxed);
+            stats.packets_blocked.fetch_add(1, Ordering::Relaxed);
 
-                let now = Self::now_ts();
-                emit_log_event(LogEntry {
-                    id: format!("{}-cidr-{}", now, pid),
-                    timestamp: now,
-                    level: LogLevel::Warning,
-                    message: format!(
-                        "CIDR Blocked: {} (pid={}) -> {}:{} ({})",
-                        app_info.name, pid, remote_ip, info.dst_port, web_match.reason
-                    ),
-                });
+            let now = Self::now_ts();
+            emit_log_event(LogEntry {
+                id: format!("{}-cidr-threatintel-{}", now, pid),
+                timestamp: now,
+                level: LogLevel::Warning,
+                message: format!(
+                    "ThreatIntel Event: {} (pid={}) -> {}:{} reason={}",
+                    app_info.name, pid, remote_ip, info.dst_port, reason_str
+                ),
+            });
 
-                return PacketDecision {
-                    packet_data: data.to_vec(),
-                    address_data: address_data.to_vec(),
-                    should_forward: false,
-                    recalc_checksums: false,
-                    _reason: web_match.reason,
-                };
-            }
+            return PacketDecision {
+                packet_data: data_vec,
+                address_data: address_data.to_vec(),
+                should_forward: false,
+                recalc_checksums: false,
+                _reason: format!("CIDR ThreatIntel Block: {}", reason_str),
+            };
         }
 
         // 3. DNS Snooping Enrichment (CRITICAL: Do this before rules!)
@@ -3872,95 +3347,6 @@ impl FirewallEngine {
             }
         }
 
-        // --- 11. DEFAULT DENY & INTERACTIVE USER PROMPTING ---
-        // If default deny is enabled and traffic was not blocked by an explicit rule, check digital signature and cloud verdict:
-        let default_deny = settings.read().map(|s| s.default_deny).unwrap_or(false);
-        if default_deny && should_forward && outbound && pid != 0 && pid != std::process::id() {
-            let app_path = app_info.path.clone();
-            if !app_path.is_empty() {
-                let app_name = app_info.name.clone();
-                let app_path_lower = app_path.to_lowercase();
-
-                let existing_decision = {
-                    let decisions = am.decisions.read().unwrap();
-                    decisions.get(&app_path_lower).cloned()
-                };
-
-                match existing_decision {
-                    Some(AppDecision::Allow) | Some(AppDecision::AllowOnce) => {
-                        // Allowed by user decision
-                    }
-                    Some(AppDecision::Block) => {
-                        should_forward = false;
-                        reason = Some(format!("Blocked by user decision for {}", app_name));
-                    }
-                    Some(AppDecision::Pending) => {
-                        // Awaiting user decision: allow flow to continue without killing host internet while prompt is evaluated
-                    }
-                    None => {
-                        // Evaluate criteria for interactive HIPS prompting:
-                        // 1. Digital signature verification (cached)
-                        let sig_info = am.get_or_verify_sig(&app_path);
-                        let mut is_sig_untrusted = sig_info.status != crate::signature_verification::SignatureStatus::Trusted;
-
-                        // Also treat as trusted if signer name matches trusted_signers.yaml (e.g. Comodo, Microsoft)
-                        if is_sig_untrusted {
-                            if let Some(ref signer) = sig_info.signer_name {
-                                if crate::signer_rules::is_trusted_signer(signer) {
-                                    is_sig_untrusted = false;
-                                }
-                            }
-                        }
-
-                        // 2. OpenEDR cloud / FLS verdict verification
-                        let verdict_raw = am.openedr_verdicts.read().unwrap().get(&pid).cloned();
-                        let is_verdict_safe = match verdict_raw.as_deref() {
-                            Some("1") | Some("0x1") | Some("safe") => true,
-                            _ => false,
-                        };
-
-                        // Untrusted binary: dispatch interactive prompt to edrgui, fail-open during prompt
-                        if is_sig_untrusted && !is_verdict_safe {
-                            let target_str = format!("{}:{}", info.dst_ip, info.dst_port);
-                            let signer_desc = match &sig_info.signer_name {
-                                Some(s) if !s.is_empty() => format!(" | Signer: {}", s),
-                                _ => String::new(),
-                            };
-                            let cert_kind = if sig_info.is_catalog_signed {
-                                " (Catalog Signed)"
-                            } else if sig_info.is_attached_signed {
-                                " (Embedded Authenticode)"
-                            } else {
-                                ""
-                            };
-                            let sig_label = format!("{}{}{}", sig_info.status.as_str(), cert_kind, signer_desc);
-                            let raw_verdict = verdict_raw.unwrap_or_else(|| "unknown".to_string());
-                            let ask_reason = "Unsigned/untrusted binary with non-safe cloud verdict".to_string();
-
-                            // Cache as Pending so we only send one prompt for this executable
-                            am.resolve_decision(&app_path_lower, AppDecision::Pending);
-
-                            let req_id = format!("ask_{}_{}", pid, Self::now_ts());
-                            Self::send_hips_ask_prompt(
-                                req_id,
-                                pid,
-                                app_name,
-                                app_path,
-                                target_str,
-                                raw_verdict,
-                                sig_label,
-                                ask_reason,
-                                Arc::clone(am),
-                            );
-                        } else {
-                            // Trusted binary or safe cloud verdict: cache as Allow so future packets for this binary bypass checks instantly
-                            am.resolve_decision(&app_path_lower, AppDecision::Allow);
-                        }
-                    }
-                }
-            }
-        }
-
         if should_forward {
             stats.packets_allowed.fetch_add(1, Ordering::Relaxed);
 
@@ -3971,7 +3357,6 @@ impl FirewallEngine {
                     &info,
                     &tls_proxy_cfg,
                     browser_mitm_warning_cache,
-                    &sdk.read().unwrap(),
                 );
             }
 
@@ -4093,25 +3478,6 @@ impl FirewallEngine {
         if log_mode && !final_forward {
             final_forward = true;
             final_reason = format!("[LOG-ONLY] {}", final_reason);
-            // Make the mode's effect directly visible: without this line the
-            // flip is silent (only the reason string changes) and the flag
-            // looks dead. Shares the 50ms blocked-log budget so a scan
-            // cannot flood the log.
-            let now = Self::now_ts();
-            let last = stats.last_log_time.load(Ordering::Relaxed);
-            if now > last + 50
-                && stats
-                    .last_log_time
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                emit_log_event(LogEntry {
-                    id: format!("{}-logonly", now),
-                    timestamp: now,
-                    level: LogLevel::Warning,
-                    message: format!("Firewall log-only mode: allowed (not blocked) | {}", final_reason),
-                });
-            }
         }
 
         PacketDecision {
@@ -4177,12 +3543,13 @@ impl FirewallEngine {
         if pid == 0 || pid == 4 {
             return;
         }
-
-        // PURE RING-0 KERNEL DRIVER KILL ONLY (Bans usermode TerminateProcess/OpenProcess)
-        // Dispatches MESSAGE_KILL_ONLY_GID directly via edrdrv.sys IOCTL device.
-        if let Ok(driver) = crate::windows::edrsvc_client::Driver::open_kernel_driver_com() {
-            let gid_with_mask = (pid as u64) | 0x8000_0000_0000_0000;
-            let _ = driver.try_kill(gid_with_mask);
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+        unsafe {
+            if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                let _ = TerminateProcess(handle, 1);
+                let _ = CloseHandle(handle);
+            }
         }
     }
 
@@ -4236,146 +3603,6 @@ impl FirewallEngine {
             }
             let _ = fs::remove_file(src);
         }
-    }
-
-    pub fn send_hips_ask_prompt(
-        request_id: String,
-        pid: u32,
-        app_name: String,
-        exe_path: String,
-        target: String,
-        raw_verdict: String,
-        sig_status: String,
-        reason: String,
-        am: Arc<AppManager>,
-    ) {
-        std::thread::Builder::new()
-            .name(format!("hips_ask_{}", pid))
-            .spawn(move || {
-                use windows::Win32::Foundation::{CloseHandle, HANDLE};
-                use windows::Win32::Storage::FileSystem::{
-                    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL,
-                    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
-                };
-                use windows::Win32::System::Pipes::WaitNamedPipeW;
-                use windows::core::PCWSTR;
-
-                // Compute PE ML analysis in this background thread so packet routing is never delayed
-                let ml_desc = if let Ok(bytes) = std::fs::read(Path::new(&exe_path)) {
-                    if bytes.len() >= 2 && &bytes[0..2] == b"MZ" {
-                        if let Some(model) = crate::ml::fast_detect::get_pe_model_ref() {
-                            let device = burn::backend::ndarray::NdArrayDevice::default();
-                            if let Some(prob) = crate::ml::inference::predict_pe(&bytes, model, &device) {
-                                format!("ML Score: {:.3}", prob)
-                            } else {
-                                "ML: Insufficient PE features".to_string()
-                            }
-                        } else {
-                            "ML: Model not loaded".to_string()
-                        }
-                    } else {
-                        "ML: Non-PE Binary".to_string()
-                    }
-                } else {
-                    "ML: File unreadable".to_string()
-                };
-                let verdict = format!("{} | {}", raw_verdict, ml_desc);
-
-                const PIPE: &str = r"\\.\pipe\HydraHipEvent";
-                let mut pipe_wide: Vec<u16> = PIPE.encode_utf16().collect();
-                pipe_wide.push(0);
-
-                let message = format!(
-                    "HIPS_ASK:{}|{}|{}|{}|{}|{}|{}|{}\n",
-                    request_id, pid, app_name, exe_path, target, verdict, sig_status, reason
-                );
-
-                let wait_ok = unsafe { WaitNamedPipeW(PCWSTR(pipe_wide.as_ptr()), 1000) };
-                if !wait_ok.as_bool() {
-                    return;
-                }
-
-                let handle = match unsafe {
-                    CreateFileW(
-                        PCWSTR(pipe_wide.as_ptr()),
-                        (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
-                        FILE_SHARE_NONE,
-                        None,
-                        OPEN_EXISTING,
-                        FILE_ATTRIBUTE_NORMAL,
-                        HANDLE::default(),
-                    )
-                } {
-                    Ok(h) if !h.is_invalid() => h,
-                    _ => return,
-                };
-
-                let mut written = 0u32;
-                let msg_bytes = message.as_bytes();
-                let _ = unsafe {
-                    WriteFile(
-                        handle,
-                        Some(msg_bytes),
-                        Some(&mut written as *mut u32),
-                        None,
-                    )
-                };
-                let _ = unsafe { FlushFileBuffers(handle) };
-
-                let mut read_buf = [0u8; 1024];
-                let mut bytes_read = 0u32;
-                let read_ok = unsafe {
-                    ReadFile(
-                        handle,
-                        Some(read_buf.as_mut_ptr() as *mut _),
-                        read_buf.len() as u32,
-                        Some(&mut bytes_read as *mut u32),
-                        None,
-                    )
-                };
-                let _ = unsafe { CloseHandle(handle) };
-
-                if read_ok.as_bool() && bytes_read > 0 {
-                    let response = String::from_utf8_lossy(&read_buf[..bytes_read as usize]);
-                    if let Some(rest) = response.trim().strip_prefix("HIPS_DECISION:") {
-                        let mut parts = rest.splitn(2, '|');
-                        let _rid = parts.next().unwrap_or("");
-                        let decision = parts.next().unwrap_or("").trim();
-                        let path_lower = exe_path.to_lowercase();
-                        match decision {
-                            "allow_always" => {
-                                am.resolve_decision(&path_lower, AppDecision::Allow);
-                                let rules_file = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_rules.json");
-                                if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(rules_file) {
-                                    use std::io::Write;
-                                    let _ = writeln!(file, r#"{{"action":"allow_always","path":"{}","time":"{}"}}"#,
-                                        path_lower.replace('\\', "\\\\"), Self::now_ts());
-                                }
-                            }
-                            "allow_once" => {
-                                am.resolve_decision(&path_lower, AppDecision::AllowOnce);
-                            }
-                            "block" => {
-                                am.resolve_decision(&path_lower, AppDecision::Block);
-                                Self::terminate_process(pid);
-                                let rules_file = PathBuf::from(r"C:\ProgramData\edrsvc\firewall_rules.json");
-                                if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(rules_file) {
-                                    use std::io::Write;
-                                    let _ = writeln!(file, r#"{{"action":"block","path":"{}","time":"{}"}}"#,
-                                        path_lower.replace('\\', "\\\\"), Self::now_ts());
-                                }
-                            }
-                            "quarantine" => {
-                                am.resolve_decision(&path_lower, AppDecision::Block);
-                                Self::terminate_process(pid);
-                                Self::quarantine_file(&exe_path, "Quarantined by User via EDRGUI");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn hips_ask thread");
     }
 
     fn extract_payload_text(bytes: &[u8]) -> Option<String> {
@@ -4490,13 +3717,9 @@ impl FirewallEngine {
             (0, 0)
         };
 
-        let mut tcp_flags_byte = None;
         let mut payload_start = header_len;
         if matches!(protocol, Protocol::TCP) {
             let tcp_header_start = header_len;
-            if tcp_header_start + 13 < data.len() {
-                tcp_flags_byte = Some(data[tcp_header_start + 13]);
-            }
             let tcp_data_offset = if tcp_header_start + 12 < data.len() {
                 ((data[tcp_header_start + 12] >> 4) as usize) * 4
             } else {
@@ -4528,8 +3751,8 @@ impl FirewallEngine {
                 let payload = &data[payload_start..];
                 payload_bytes = Some(payload);
 
-                // Check for HTTPS (port 443) - TLS SNI extraction
-                if dst_port == 443 || src_port == 443 {
+                // Check for HTTPS (port 443 or any TLS Client Hello handshake) - TLS SNI extraction
+                if dst_port == 443 || src_port == 443 || super::tls_parser::is_tls_handshake(payload) {
                     tls_handshake = super::tls_parser::is_tls_handshake(payload);
                     if let Some(sni_host) = super::tls_parser::extract_sni(payload) {
                         // Treat HTTPS SNI as a URL root so downstream hostname/url
@@ -4633,7 +3856,6 @@ impl FirewallEngine {
                 detected_file_type: None,
                 http_request_body: None,
                 http_response_body: None,
-                tcp_flags: tcp_flags_byte,
             },
             payload_start,
         ))
@@ -4865,14 +4087,6 @@ impl FirewallEngine {
         if let Some(d) = self.divert_handle.lock().unwrap().take() {
             let ptr =
                 Arc::as_ptr(&d.0) as *mut windivert::WinDivert<windivert::prelude::NetworkLayer>;
-            unsafe {
-                let _ = (*ptr).shutdown(WinDivertShutdownMode::Both);
-            }
-        }
-
-        if let Some(d) = self.flow_divert_handle.lock().unwrap().take() {
-            let ptr =
-                Arc::as_ptr(&d.0) as *mut windivert::WinDivert<windivert::prelude::FlowLayer>;
             unsafe {
                 let _ = (*ptr).shutdown(WinDivertShutdownMode::Both);
             }
