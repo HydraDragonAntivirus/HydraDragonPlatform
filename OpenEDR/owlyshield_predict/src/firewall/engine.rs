@@ -768,6 +768,11 @@ pub struct Statistics {
     pub tcp_connections: AtomicU64,
     pub last_log_time: AtomicU64,         // Rate limiting for blocked
     pub last_allowed_log_time: AtomicU64, // Rate limiting for allowed
+    /// Packets lost because BOTH the processed reinject and the raw
+    /// fail-open fallback send failed (transport/queue/driver level).
+    pub reinject_failed: AtomicU64,
+    /// Rate limiting for the reinject-failed transport alarm below.
+    pub last_reinject_fail_log: AtomicU64,
 }
 
 impl Default for Statistics {
@@ -782,6 +787,8 @@ impl Default for Statistics {
             tcp_connections: AtomicU64::new(0),
             last_log_time: AtomicU64::new(0),
             last_allowed_log_time: AtomicU64::new(0),
+            reinject_failed: AtomicU64::new(0),
+            last_reinject_fail_log: AtomicU64::new(0),
         }
     }
 }
@@ -3395,7 +3402,42 @@ impl FirewallEngine {
                                         }
                                         if divert_w.send(&reinject_packet).is_err() {
                                             // CRITICAL FAIL-OPEN fallback
-                                            let _ = divert_w.send(&packet);
+                                            if divert_w.send(&packet).is_err() {
+                                                // Both sends failed: the packet is LOST
+                                                // (queue overflow, handle teardown, driver
+                                                // drop). Count it and alarm (5s budget) so
+                                                // silent transport loss is visible instead
+                                                // of a mystery timeout (e.g. dead DNS).
+                                                let lost = stats_w
+                                                    .reinject_failed
+                                                    .fetch_add(1, Ordering::Relaxed)
+                                                    + 1;
+                                                let now = Self::now_ts();
+                                                let last = stats_w
+                                                    .last_reinject_fail_log
+                                                    .load(Ordering::Relaxed);
+                                                if now > last + 5000
+                                                    && stats_w
+                                                        .last_reinject_fail_log
+                                                        .compare_exchange(
+                                                            last,
+                                                            now,
+                                                            Ordering::Relaxed,
+                                                            Ordering::Relaxed,
+                                                        )
+                                                        .is_ok()
+                                                {
+                                                    emit_log_event(LogEntry {
+                                                        id: format!("{}-reinject-fail", now),
+                                                        timestamp: now,
+                                                        level: LogLevel::Error,
+                                                        message: format!(
+                                                            "Transport loss: WinDivert reinject failed (total lost: {})",
+                                                            lost
+                                                        ),
+                                                    });
+                                                }
+                                            }
                                         }
                                     } else {
                                         // Packet is blocked - only if confirmed malicious
