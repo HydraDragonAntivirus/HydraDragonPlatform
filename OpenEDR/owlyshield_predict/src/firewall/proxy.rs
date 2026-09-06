@@ -188,6 +188,37 @@ impl HttpBody for HeadThenStream {
 
 // ── Generic error response builders ────────────────────────────────────────────
 
+/// Burp-style landing page served when the proxy address itself is visited
+/// in a browser (e.g. http://127.0.0.1:8877/). Always English. Served
+/// locally — never forwarded upstream (forwarding to self would loop the
+/// proxy back into its own listener).
+fn proxy_status_page(listen_addr: &str) -> http_mitm_proxy::hyper::Response<BoxBody<Bytes, DynErr>> {
+    let html = format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>HydraDragon Transparent TLS Proxy</title></head><body>\
+         <h1>HydraDragon Transparent TLS Proxy is active and running.</h1>\
+         <p>Listener: {}</p>\
+         <p>This port intercepts outbound TLS for inspection. \
+         Configure your targets via monitored hosts; all other traffic passes through untouched.</p>\
+         </body></html>",
+        listen_addr
+    );
+    let body = boxed_full(Bytes::from(html.into_bytes()));
+    http_mitm_proxy::hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            http_mitm_proxy::hyper::header::CONTENT_TYPE,
+            "text/html; charset=utf-8",
+        )
+        .body(body)
+        .unwrap_or_else(|_| {
+            http_mitm_proxy::hyper::Response::builder()
+                .status(StatusCode::OK)
+                .body(boxed_full(Bytes::new()))
+                .unwrap()
+        })
+}
+
 /// Build a 502 Bad Gateway response when upstream fails.
 fn error_response_502() -> http_mitm_proxy::hyper::Response<BoxBody<Bytes, DynErr>> {
     let body = boxed_full(Bytes::from_static(b"Bad Gateway"));
@@ -586,6 +617,27 @@ async fn handle_proxy_request(
         &host
     }
     .trim();
+
+    // ── Self-visit: serve the local status page (Burp-style) ──────────────
+    // A browser pointed directly at the listener must get a local page, not
+    // an upstream forward (forwarding 127.0.0.1:8877 upstream would dial the
+    // proxy itself and loop). SDK/CIDR evaluation is skipped for this path.
+    {
+        let (cfg_host, cfg_port) = {
+            let s = settings.read().unwrap();
+            (
+                s.tls_proxy.listen_host.clone(),
+                s.tls_proxy.listen_port,
+            )
+        };
+        let self_host = clean_host.eq_ignore_ascii_case("127.0.0.1")
+            || clean_host.eq_ignore_ascii_case("localhost")
+            || clean_host == "::1"
+            || clean_host.eq_ignore_ascii_case(&cfg_host);
+        if port == cfg_port && self_host {
+            return Ok(proxy_status_page(&format!("{}:{}", cfg_host, cfg_port)));
+        }
+    }
 
     let cidr_hit = if let Ok(ip) = clean_host.parse::<IpAddr>() {
         if web_filter.is_blocked_ip(ip) {
