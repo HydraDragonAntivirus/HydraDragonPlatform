@@ -3163,6 +3163,8 @@ impl FirewallEngine {
                                             let mut dst_port = 0;
                                             let mut src_ip = None;
                                             let mut dst_ip = None;
+                                            let mut p_hostname: Option<&str> = None;
+                                            let mut p_full_url: Option<&str> = None;
                                             if let Some((ref p_info, _)) = pre_parsed {
                                                 is_tcp = matches!(
                                                     p_info.protocol,
@@ -3172,6 +3174,8 @@ impl FirewallEngine {
                                                 dst_port = p_info.dst_port;
                                                 src_ip = Some(p_info.src_ip);
                                                 dst_ip = Some(p_info.dst_ip);
+                                                p_hostname = p_info.hostname.as_deref();
+                                                p_full_url = p_info.full_url.as_deref();
                                             }
 
                                             if is_tcp {
@@ -3236,8 +3240,15 @@ impl FirewallEngine {
                                                     }
                                                 } else if outbound
                                                     && dst_port == 443
+                                                    && pid != 0
                                                     && pid != std::process::id()
                                                     && !http_mitm_proxy::is_registered_upstream_local_port(src_port)
+                                                    && Self::should_proxy_intercept(
+                                                        &tls_proxy_cfg,
+                                                        p_hostname,
+                                                        p_full_url,
+                                                        &sdk_w.read().unwrap(),
+                                                    )
                                                 {
                                                     if let (Some(orig_dst), Some(orig_src)) =
                                                         (dst_ip, src_ip)

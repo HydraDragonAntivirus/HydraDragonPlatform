@@ -103,6 +103,26 @@
 						"item": "quarantineTarget",
 						"localPath": "quarantineTarget",
 						"default": ""
+					},
+					// Copy registry key set by PTM policy (PUA persistence rules).
+					// MLE events are created with clone:false so they carry no
+					// 'registry' object; without these fields the output log shows
+					// the process but never WHICH key fired the rule.
+					{
+						"item": "registryDeleteTarget",
+						"localPath": "registryDeleteTarget",
+						"default": ""
+					},
+					{
+						"item": "registryDeleteTargetRaw",
+						"localPath": "registryDeleteTargetRaw",
+						"default": ""
+					},
+					// Copy notifier title when present (embeds the flagged reg key)
+					{
+						"item": "title",
+						"localPath": "title",
+						"default": "<undefined>"
 					}
 				],
 				"args": [
@@ -390,6 +410,18 @@
 					{
 						"item": "path",
 						"localPath": "registry.path",
+						"default": "<undefined>"
+					},
+					// Copy 'abstractPath' - normalized key (what patterns match)
+					{
+						"item": "abstractPath",
+						"localPath": "registry.abstractPath",
+						"default": "<undefined>"
+					},
+					// Copy 'rawPath' - raw key form (what patterns match)
+					{
+						"item": "rawPath",
+						"localPath": "registry.rawPath",
 						"default": "<undefined>"
 					}
 				],
