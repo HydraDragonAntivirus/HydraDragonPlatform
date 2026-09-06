@@ -3337,8 +3337,14 @@ impl FirewallEngine {
                                                             if ok {
                                                                 recalc_checksums = true;
                                                                 loopback_flag = Some(true);
-                                                                // Local listeners only receive inbound packets; must clear outbound flag
-                                                                outbound_flag = Some(false);
+                                                                // Keep outbound=true: local delivery happens on
+                                                                // the outbound/loopback path, exactly like every
+                                                                // working 127.0.0.1 flow (status page loads;
+                                                                // 5890 RPC flows). Clearing outbound misroutes
+                                                                // the packet into the inbound path where no
+                                                                // socket ever answers it (steer logged, proxy
+                                                                // silent, client retransmits). IfIdx is ignored
+                                                                // for outbound injection, so it is left alone.
                                                                 // Audit (SYN only => once per steered flow):
                                                                 // name the exact cause so "false still
                                                                 // touches traffic" cases are traceable
