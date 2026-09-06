@@ -1817,36 +1817,51 @@ impl FirewallEngine {
     /// Returns false if host is bypassed or pinned.
     /// When mitm_all_traffic is false, ONLY targets matching monitored_hosts (or SDK rules/monitored_sites)
     /// are intercepted; all other traffic bypasses the proxy with zero overhead.
+    /// NOTE: "false" mode still steers SDK-matched domains, so it is NOT a
+    /// global no-touch switch — use the returned reason (see below) to audit.
     fn should_proxy_intercept(
         tls_proxy: &TlsProxyConfig,
         hostname: Option<&str>,
         full_url: Option<&str>,
         sdk: &super::sdk::SdkRegistry,
     ) -> bool {
+        Self::intercept_reason(tls_proxy, hostname, full_url, sdk).is_some()
+    }
+
+    /// Same verdict as [`Self::should_proxy_intercept`], but names the cause
+    /// ("mitm_all_traffic", "monitored_hosts:<pattern>", "sdk:<match>") so
+    /// every steering decision can be audited in logs. None == bypass/direct.
+    fn intercept_reason(
+        tls_proxy: &TlsProxyConfig,
+        hostname: Option<&str>,
+        full_url: Option<&str>,
+        sdk: &super::sdk::SdkRegistry,
+    ) -> Option<String> {
         // 1. Dynamic fallback cache & explicit user bypass hosts
         if Self::proxy_bypass_matches_target(tls_proxy, hostname, full_url, None) {
-            return false;
+            return None;
         }
 
         // 2. Full interception mode
         if tls_proxy.mitm_all_traffic {
-            return true;
+            return Some("mitm_all_traffic".to_string());
         }
 
         // 3. Targeted mode: check against monitored_hosts and SDK monitored_sites
         let Some(target) = Self::select_proxy_bypass_target(hostname, full_url, None) else {
-            return false;
+            return None;
         };
 
-        if tls_proxy.monitored_hosts.iter().any(|entry| {
+        if let Some(entry) = tls_proxy.monitored_hosts.iter().find(|entry| {
             Self::normalize_proxy_bypass_entry(entry).is_some_and(|normalized| {
                 Self::proxy_bypass_entry_matches_target(&normalized, &target)
             })
         }) {
-            return true;
+            return Some(format!("monitored_hosts:{entry}"));
         }
 
-        sdk.is_monitored_site(&target)
+        sdk.monitored_site_match(&target)
+            .map(|m| format!("sdk:{m}"))
     }
 
     pub fn sync_proxy_runtime(&self) {
@@ -2022,14 +2037,14 @@ impl FirewallEngine {
         browser_mitm_warning_cache: &Arc<Mutex<HashSet<String>>>,
         sdk: &super::sdk::SdkRegistry,
     ) {
-        if !Self::should_proxy_intercept(
+        let Some(why) = Self::intercept_reason(
             tls_proxy,
             info.hostname.as_deref(),
             info.full_url.as_deref(),
             sdk,
-        ) {
+        ) else {
             return;
-        }
+        };
 
         let host_label = info
             .hostname
@@ -2059,12 +2074,13 @@ impl FirewallEngine {
             timestamp: now,
             level: LogLevel::Info,
             message: format!(
-                "Proxy Intercept: {} (pid={}) -> {}:{} via transparent TLS proxy {}",
+                "Proxy Intercept: {} (pid={}) -> {}:{} via transparent TLS proxy {} ({})",
                 app_info.name,
                 info.process_id,
                 host_label,
                 info.dst_port,
-                Self::proxy_addr_string(tls_proxy)
+                Self::proxy_addr_string(tls_proxy),
+                why
             ),
         });
     }
@@ -3316,6 +3332,40 @@ impl FirewallEngine {
                                                                 loopback_flag = Some(true);
                                                                 // Local listeners only receive inbound packets; must clear outbound flag
                                                                 outbound_flag = Some(false);
+                                                                // Audit (SYN only => once per steered flow):
+                                                                // name the exact cause so "false still
+                                                                // touches traffic" cases are traceable
+                                                                // to a rule instead of a mystery.
+                                                                if is_syn {
+                                                                    if let Some(why) =
+                                                                        Self::intercept_reason(
+                                                                            &tls_proxy_cfg,
+                                                                            p_hostname,
+                                                                            p_full_url,
+                                                                            &sdk_w.read().unwrap(),
+                                                                        )
+                                                                    {
+                                                                        let now = Self::now_ts();
+                                                                        let target = p_hostname
+                                                                            .unwrap_or("unknown");
+                                                                        emit_log_event(LogEntry {
+                                                                            id: format!(
+                                                                                "{}-steer",
+                                                                                now
+                                                                            ),
+                                                                            timestamp: now,
+                                                                            level: LogLevel::Info,
+                                                                            message: format!(
+                                                                                "Proxy steer: {}:{} -> 127.0.0.1:{} ({})",
+                                                                                target,
+                                                                                dst_port,
+                                                                                tls_proxy_cfg
+                                                                                    .listen_port,
+                                                                                why
+                                                                            ),
+                                                                        });
+                                                                    }
+                                                                }
                                                                 if tcp_is_fin_or_rst(&packet_data) {
                                                                     nat_table_w.remove(src_port);
                                                                 }
@@ -3995,6 +4045,25 @@ impl FirewallEngine {
         if log_mode && !final_forward {
             final_forward = true;
             final_reason = format!("[LOG-ONLY] {}", final_reason);
+            // Make the mode's effect directly visible: without this line the
+            // flip is silent (only the reason string changes) and the flag
+            // looks dead. Shares the 50ms blocked-log budget so a scan
+            // cannot flood the log.
+            let now = Self::now_ts();
+            let last = stats.last_log_time.load(Ordering::Relaxed);
+            if now > last + 50
+                && stats
+                    .last_log_time
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                emit_log_event(LogEntry {
+                    id: format!("{}-logonly", now),
+                    timestamp: now,
+                    level: LogLevel::Warning,
+                    message: format!("Firewall log-only mode: allowed (not blocked) | {}", final_reason),
+                });
+            }
         }
 
         PacketDecision {

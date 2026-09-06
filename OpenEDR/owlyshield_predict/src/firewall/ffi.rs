@@ -96,6 +96,68 @@ pub extern "system" fn HydraDragonFirewall_Stop() -> i32 {
     1
 }
 
+/// Enable (1) or disable (0) transparent TLS (MITM) interception at runtime.
+/// Called by edrsvc (`setMitmEnabled` JSON-RPC) on behalf of the Pascal GUI
+/// tray toggle. Flips `tls_proxy.auto_start`, kicks the proxy runtime so the
+/// listener starts/stops immediately, and persists to both settings files.
+/// Returns 1 on success, 0 when the engine is not running.
+#[unsafe(no_mangle)]
+pub extern "system" fn owlyshield_firewall_set_mitm_enabled(enabled: u8) -> i32 {
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    let Some(engine) = super::headless::engine() else {
+        set_last_error("Firewall engine is not running");
+        return 0;
+    };
+    {
+        let mut settings = engine.settings.write().unwrap();
+        settings.tls_proxy.auto_start = enabled != 0;
+    }
+    engine.sync_proxy_runtime();
+    engine.save_settings();
+    emit_log_event(LogEntry {
+        id: format!("{}-mitm-toggle", now_ms()),
+        timestamp: now_ms(),
+        level: LogLevel::Info,
+        message: format!(
+            "Transparent TLS proxy MITM interception {} via GUI toggle",
+            if enabled != 0 { "ENABLED" } else { "DISABLED" }
+        ),
+    });
+    clear_last_error();
+    1
+}
+
+/// Query whether MITM interception is currently enabled (1) or disabled (0).
+/// Returns -1 only if neither a live engine nor readable settings exist.
+/// Falls back to the persisted settings file so the GUI shows the on-disk
+/// state even while the service is stopped.
+#[unsafe(no_mangle)]
+pub extern "system" fn owlyshield_firewall_get_mitm_enabled() -> i32 {
+    if let Some(engine) = super::headless::engine() {
+        return if engine.settings.read().unwrap().tls_proxy.auto_start {
+            1
+        } else {
+            0
+        };
+    }
+    match super::engine::FirewallEngine::load_settings() {
+        Some(s) => {
+            if s.tls_proxy.auto_start {
+                1
+            } else {
+                0
+            }
+        }
+        None => 1,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn HydraDragonFirewall_GetLastErrorMessage(
     buffer: *mut c_char,

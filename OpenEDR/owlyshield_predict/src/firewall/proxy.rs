@@ -1017,14 +1017,40 @@ async fn handle_proxy_request(
     };
 
     // ── Emit activity log ────────────────────────────────────────────────────
+    // log_full_bodies=true appends the (already fully buffered) request and
+    // response bodies to the line so the flag has a visible effect. Bodies
+    // are capped per line so a huge download cannot blow up the jsonl log.
+    fn clip_body(s: &str) -> String {
+        const CAP: usize = 16 * 1024;
+        if s.len() > CAP {
+            format!("{}…[truncated {} bytes]", &s[..CAP], s.len() - CAP)
+        } else {
+            s.to_string()
+        }
+    }
     let ts = now_ts();
-    let show_blocked_http_only = settings.read().unwrap().show_blocked_http_inspector_only;
+    let (show_blocked_http_only, log_bodies) = {
+        let s = settings.read().unwrap();
+        (
+            s.show_blocked_http_inspector_only,
+            s.log_full_bodies,
+        )
+    };
     if !show_blocked_http_only {
+        let mut message = format!("Proxy: {} {}:{}{} → {}", method, host, port, path, status);
+        if log_bodies {
+            if let Some(ref b) = request_body {
+                message.push_str(&format!(" | req_body={}", clip_body(b)));
+            }
+            if let Some(ref b) = response_body {
+                message.push_str(&format!(" | res_body={}", clip_body(b)));
+            }
+        }
         emit_log_event(LogEntry {
             id: format!("{}-intercept-{}-{}", ts, host, port),
             timestamp: ts,
             level: LogLevel::Info,
-            message: format!("Proxy: {} {}:{}{} → {}", method, host, port, path, status),
+            message,
         });
     }
 

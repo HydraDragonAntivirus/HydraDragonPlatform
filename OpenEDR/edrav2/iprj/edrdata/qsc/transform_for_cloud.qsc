@@ -117,12 +117,6 @@
 						"item": "registryDeleteTargetRaw",
 						"localPath": "registryDeleteTargetRaw",
 						"default": ""
-					},
-					// Copy notifier title when present (embeds the flagged reg key)
-					{
-						"item": "title",
-						"localPath": "title",
-						"default": "<undefined>"
 					}
 				],
 				"args": [

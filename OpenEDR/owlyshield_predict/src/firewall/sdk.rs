@@ -2379,26 +2379,34 @@ impl SdkRegistry {
 
     /// Checks whether `host` is targeted by monitored_sites.yaml or any active SDK domain rule.
     pub fn is_monitored_site(&self, host: &str) -> bool {
+        self.monitored_site_match(host).is_some()
+    }
+
+    /// Same check as [`Self::is_monitored_site`], but returns the matched
+    /// monitored_sites pattern or SDK rule name so steering decisions that
+    /// depend on it can be audited in logs (e.g. "which rule steered msn.com
+    /// into the proxy even with mitm_all_traffic=false").
+    pub fn monitored_site_match(&self, host: &str) -> Option<String> {
         let clean = host.trim().trim_start_matches('.').to_ascii_lowercase();
         if clean.is_empty() {
-            return false;
+            return None;
         }
 
         for pattern in &self.monitored_sites {
             let pat = pattern.trim().trim_start_matches('.').to_ascii_lowercase();
             if pat == clean {
-                return true;
+                return Some(format!("monitored_sites:{}", pattern.trim()));
             }
             if let Some(suffix) = pat.strip_prefix("*.") {
                 if clean == suffix || clean.ends_with(&format!(".{}", suffix)) {
-                    return true;
+                    return Some(format!("monitored_sites:{}", pattern.trim()));
                 }
             } else if let Some(suffix) = pat.strip_prefix('*') {
                 if clean.ends_with(suffix) {
-                    return true;
+                    return Some(format!("monitored_sites:{}", pattern.trim()));
                 }
             } else if clean.ends_with(&format!(".{}", pat)) {
-                return true;
+                return Some(format!("monitored_sites:{}", pattern.trim()));
             }
         }
 
@@ -2408,12 +2416,12 @@ impl SdkRegistry {
             }
             if let Some(ref d) = rule.domain {
                 if d.matches(Some(&clean)) {
-                    return true;
+                    return Some(format!("sdk-rule:{}", rule.name));
                 }
             }
         }
 
-        false
+        None
     }
 
     pub fn add_rule(&mut self, rule: SdkRule) {

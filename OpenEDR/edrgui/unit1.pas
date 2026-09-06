@@ -16,7 +16,8 @@ interface
 
 uses
   Classes, SysUtils, Forms, Controls, Graphics, Dialogs, ExtCtrls, Menus,
-  Windows, Registry, USvcControl, UAlert, UGuiNotify, UHipPipe;
+  Windows, Registry, fpjson, jsonparser,
+  USvcControl, UAlert, UGuiNotify, UHipPipe;
 
 type
 
@@ -38,6 +39,7 @@ type
     Timer1: TTimer;
     TrayIcon1: TTrayIcon;
     MenuPauseResume: TMenuItem;
+    MenuMitmToggle: TMenuItem;
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure MenuExitClick(Sender: TObject);
@@ -47,6 +49,7 @@ type
     procedure MenuStopClick(Sender: TObject);
     procedure MenuUninstallClick(Sender: TObject);
     procedure MenuPauseResumeClick(Sender: TObject);
+    procedure MenuMitmToggleClick(Sender: TObject);
     procedure Timer1Timer(Sender: TObject);
     procedure TrayIcon1DblClick(Sender: TObject);
   private
@@ -57,11 +60,15 @@ type
     FNotifier: TGuiNotifierThread;
     FHiPPipe: THipPipeListener;
     FProtectionPaused: Boolean;
+    FMitmEnabled: Boolean;
     FBehaviorLogs: TStringList;
     FMLPredictions: TStringList;
     function ReadProtectionPaused: Boolean;
     procedure WriteProtectionPaused(APaused: Boolean);
     procedure SetPauseCaption(APaused: Boolean);
+    function ReadMitmEnabled: Boolean;
+    procedure WriteMitmEnabled(AEnabled: Boolean);
+    procedure SetMitmCaption(AEnabled: Boolean);
     procedure RunCommand(ACmd: TSvcCommand);
     procedure OnCommandDone(Sender: TObject; Cmd: TSvcCommand;
       Success: Boolean; ExitCode: DWORD; const Output: string);
@@ -117,6 +124,16 @@ begin
   PopupMenu1.Items.Insert(PopupMenu1.Items.IndexOf(MenuStatus) + 1,
     MenuPauseResume);
   SetPauseCaption(ReadProtectionPaused);
+
+  // MITM interception toggle (firewall TLS proxy auto_start via
+  // setMitmEnabled/getMitmStatus JSON-RPC; the engine applies it live and
+  // persists it to both settings files).
+  MenuMitmToggle := TMenuItem.Create(Self);
+  MenuMitmToggle.OnClick := @MenuMitmToggleClick;
+  PopupMenu1.Items.Insert(PopupMenu1.Items.IndexOf(MenuPauseResume) + 1,
+    MenuMitmToggle);
+  FMitmEnabled := True;
+  SetMitmCaption(ReadMitmEnabled);
 
   FBehaviorLogs := TStringList.Create;
   FMLPredictions := TStringList.Create;
@@ -279,6 +296,9 @@ begin
     TrayIcon1.Hint := TrayIcon1.Hint + LineEnding + 'Protection: PAUSED';
   end;
   SetPauseCaption(ReadProtectionPaused);
+
+  // Keep the MITM caption truthful (queries the live engine state).
+  SetMitmCaption(ReadMitmEnabled);
 
   UpdateMenuEnabled(NewState);
 end;
@@ -613,6 +633,81 @@ end;
 procedure TForm1.MenuPauseResumeClick(Sender: TObject);
 begin
   WriteProtectionPaused(not ReadProtectionPaused);
+end;
+
+// ---------------------------------------------------------------------------
+// MITM Interception toggle (firewall TLS proxy)
+//
+// Reads/writes the live engine flag through edrsvc JSON-RPC
+// (getMitmStatus/setMitmEnabled on 127.0.0.1:5890). The engine flips
+// tls_proxy.auto_start, restarts/stops the listener immediately and
+// persists the value to both settings files, so the toggle survives
+// service restarts.
+// ---------------------------------------------------------------------------
+
+function TForm1.ReadMitmEnabled: Boolean;
+var
+  Req, Resp: string;
+  j, d: TJSONData;
+begin
+  try
+    Req := '{"jsonrpc":"2.0","id":1,"method":"getMitmStatus","params":{}}';
+    if HttpPostJson(GUI_RPC_HOST, GUI_RPC_PORT, Req, Resp) then
+    begin
+      j := GetJSON(Resp);
+      try
+        d := j.FindPath('result.enabled');
+        if d <> nil then
+          FMitmEnabled := d.AsBoolean;
+      finally
+        j.Free;
+      end;
+    end;
+  except
+    // transport/parse failure: keep last known mirror value
+  end;
+  Result := FMitmEnabled;
+end;
+
+procedure TForm1.WriteMitmEnabled(AEnabled: Boolean);
+var
+  Req, Resp: string;
+begin
+  if AEnabled then
+    Req := '{"jsonrpc":"2.0","id":1,"method":"setMitmEnabled","params":{"enabled":true}}'
+  else
+    Req := '{"jsonrpc":"2.0","id":1,"method":"setMitmEnabled","params":{"enabled":false}}';
+
+  // Send directly to edrsvc in-memory via JSON-RPC
+  HttpPostJson(GUI_RPC_HOST, GUI_RPC_PORT, Req, Resp);
+
+  FMitmEnabled := AEnabled;
+  SetMitmCaption(AEnabled);
+
+  if AEnabled then
+    TAlertForm.ShowAlert('MITM interception enabled',
+      'Transparent TLS proxy interception is active again.',
+      asSuccess, 3000)
+  else
+    TAlertForm.ShowAlert('MITM interception disabled',
+      'HTTPS traffic flows direct without TLS interception.',
+      asWarning, 4000);
+end;
+
+procedure TForm1.SetMitmCaption(AEnabled: Boolean);
+begin
+  if MenuMitmToggle <> nil then
+  begin
+    if AEnabled then
+      MenuMitmToggle.Caption := 'Disable MITM Interception'
+    else
+      MenuMitmToggle.Caption := 'Enable MITM Interception';
+  end;
+end;
+
+procedure TForm1.MenuMitmToggleClick(Sender: TObject);
+begin
+  WriteMitmEnabled(not ReadMitmEnabled);
 end;
 
 procedure TForm1.RunCommand(ACmd: TSvcCommand);
