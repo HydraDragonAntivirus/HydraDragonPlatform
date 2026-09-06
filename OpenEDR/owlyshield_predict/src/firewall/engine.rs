@@ -3250,13 +3250,46 @@ impl FirewallEngine {
                                                         &sdk_w.read().unwrap(),
                                                     )
                                                 {
-                                                    if let (Some(orig_dst), Some(orig_src)) =
-                                                        (dst_ip, src_ip)
+                                                    // SYN-anchor: steer only a NEW SYN or an
+                                                    // already-NATed flow. Hijacking mid-connection
+                                                    // data the proxy never handshook draws an
+                                                    // instant RST (this is also how the proxy's
+                                                    // own upstream handshake with itself — the
+                                                    // 502 "InvalidContentType" self-loop — is cut:
+                                                    // a mid-stream packet is never steered).
+                                                    let is_syn = pre_parsed.as_ref().map_or(false, |(p, _)| {
+                                                        p.tcp_flags.is_some_and(|f| f & 0x02 != 0)
+                                                    });
+                                                    let already_routed =
+                                                        nat_table_w.get(src_port).is_some();
+                                                    // Direct-started flows stay direct.
+                                                    if (is_syn || already_routed)
+                                                        && let (Some(orig_dst), Some(orig_src)) =
+                                                            (dst_ip, src_ip)
                                                     {
+                                                        // Fresh owner check (new SYNs only): the cached
+                                                        // port->pid map may still attribute the proxy's
+                                                        // own brand-new upstream socket to a previous
+                                                        // owner (stale entry) and loop the proxy into
+                                                        // itself (502 "InvalidContentType" self-loop).
+                                                        // A live table read returns 0 for not-yet-
+                                                        // visible sockets (-> direct, safe) and the
+                                                        // true owner otherwise. Already-NATed flows
+                                                        // keep affinity without re-resolving.
+                                                        let owner_ok = already_routed || {
+                                                            let fresh_pid =
+                                                                Self::resolve_pid_from_port(
+                                                                    src_port, true,
+                                                                );
+                                                            fresh_pid != 0
+                                                                && fresh_pid
+                                                                    != std::process::id()
+                                                        };
                                                         if !Self::is_loopback(orig_dst)
                                                             && !orig_dst.is_unspecified()
                                                             && !orig_dst.is_multicast()
                                                             && orig_dst.is_ipv4()
+                                                            && owner_ok
                                                         {
                                                             nat_table_w.insert(
                                                                 src_port,
