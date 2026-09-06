@@ -28,10 +28,6 @@ use tokio::sync::oneshot;
 use super::engine::{FirewallSettings, LogEntry, LogLevel, PacketInfo, Protocol, emit_log_event};
 use super::sdk::{PacketContext, RuleAction, SdkRegistry};
 
-lazy_static::lazy_static! {
-    static ref THREAT_INTEL: Arc<crate::threat_intel::ThreatIntelScanner> = Arc::new(crate::threat_intel::ThreatIntelScanner::load_default());
-}
-
 // ── CA persistence paths ───────────────────────────────────────────────────────
 
 /// Directory-relative filenames used to persist the CA across restarts.
@@ -332,6 +328,7 @@ pub async fn run_proxy(
     ca: rcgen::Issuer<'static, KeyPair>,
     sdk: Arc<RwLock<SdkRegistry>>,
     settings: Arc<RwLock<FirewallSettings>>,
+    web_filter: Arc<super::web_filter::WebFilter>,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
     let handshake_timeout = {
@@ -354,10 +351,11 @@ pub async fn run_proxy(
                         let client = client.clone();
                         let sdk = sdk.clone();
                         let settings = settings.clone();
+                        let web_filter = web_filter.clone();
 
                         async move {
                             // Wrap in generic error handler: all errors return 502
-                            match handle_proxy_request(client, sdk, settings, req).await {
+                            match handle_proxy_request(client, sdk, settings, web_filter, req).await {
                                 Ok(res) => Ok::<_, http_mitm_proxy::default_client::Error>(res),
                                 Err(e) => {
                                     let is_ignorable = e.contains("10054")
@@ -470,15 +468,22 @@ async fn handle_proxy_request(
     client: DefaultClient,
     sdk: Arc<RwLock<SdkRegistry>>,
     settings: Arc<RwLock<FirewallSettings>>,
+    web_filter: Arc<super::web_filter::WebFilter>,
     req: http_mitm_proxy::hyper::Request<http_mitm_proxy::hyper::body::Incoming>,
 ) -> Result<http_mitm_proxy::hyper::Response<BoxBody<Bytes, DynErr>>, String> {
     // ── Validate request ────────────────────────────────────────────────────
     validate_request(&req)?;
 
-    // Determine MAX_BODY and timeouts based on settings
+    // Determine MAX_BODY and timeouts based on settings.
+    // Full-response inspection is independent from log verbosity:
+    // log_full_bodies only affects what is written to logs, while
+    // inspect_full_responses decides how much of an intercepted body the
+    // SDK rules actually get to see (streaming tail bypasses inspection).
     let (max_body, request_timeout, response_timeout) = {
         let settings_guard = settings.read().unwrap();
-        let max = if settings_guard.log_full_bodies {
+        let max = if settings_guard.log_full_bodies
+            || settings_guard.tls_proxy.inspect_full_responses
+        {
             usize::MAX
         } else {
             64 * 1024
@@ -649,6 +654,7 @@ async fn handle_proxy_request(
         http_referer: referer.clone(),
         payload_entropy: None,
         payload_sample: None,
+        tcp_flags: None,
         payload_urls: vec![],
         payload_domains: vec![],
         image_path: app_path.clone(),
@@ -663,10 +669,12 @@ async fn handle_proxy_request(
         process_path: app_path,
     };
 
-    // ── Threat Intelligence Scanner Check (Strictly CIDR IP Blocklist) ───
+    // ── CIDR Blocklist Check (WebFilter) ───
+    // Strictly CIDR IP blocklist (CIDRBlackListIPv4/v6.txt). Loopback and
+    // unspecified addresses never match.
     let mut threat_match = None;
     if let Ok(ip) = host.parse::<IpAddr>() {
-        threat_match = THREAT_INTEL.check_ip(ip);
+        threat_match = web_filter.find_match(ip).map(|m| m.reason);
     }
 
     if let Some(reason) = threat_match {
