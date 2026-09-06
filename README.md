@@ -1,5 +1,6 @@
 # Hydra Dragon Antivirus
 ## WARNING: Highly outdated documenation here but for reference I keep it.
+## Other than OpenEDR, MBRFilter, Sanctum etc. directories are fully deperecated  for performance.
 
 <p align="center">
   <img
