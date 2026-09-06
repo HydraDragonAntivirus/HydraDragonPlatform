@@ -191,7 +191,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    pub fn label(&self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             Protocol::TCP => "TCP",
             Protocol::UDP => "UDP",
@@ -237,8 +237,6 @@ pub struct PacketInfo {
     pub payload_entropy: Option<f64>,
     /// Hex preview of the first bytes of the payload for forensic visibility
     pub payload_sample: Option<String>,
-    /// Raw TCP flags byte (SYN, ACK, FIN, RST, PSH, URG)
-    pub tcp_flags: Option<u8>,
     /// URLs discovered anywhere in the payload (helps catch malware beacons and C2s)
     pub payload_urls: Vec<String>,
     /// Domain-like tokens discovered in the payload for additional matching
@@ -975,6 +973,7 @@ pub struct AppManager {
     pub suspicious_pids: RwLock<HashSet<u32>>,
     pub cloud_trusted_pids: RwLock<HashSet<u32>>,
     pub openedr_verdicts: RwLock<HashMap<u32, String>>,
+    pub threat_intel: Arc<crate::threat_intel::ThreatIntelScanner>,
     /// Tracks which slot (0-based) the user is currently viewing, for the position counter.
     pub view_index: AtomicU64,
 }
@@ -993,6 +992,7 @@ impl AppManager {
             suspicious_pids: RwLock::new(HashSet::new()),
             cloud_trusted_pids: RwLock::new(HashSet::new()),
             openedr_verdicts: RwLock::new(HashMap::new()),
+            threat_intel: Arc::new(crate::threat_intel::ThreatIntelScanner::load_default()),
             view_index: AtomicU64::new(0),
         }
     }
@@ -1464,7 +1464,6 @@ pub struct FirewallEngine {
     pub tls_proxy_backend_child: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     pub windows_root_trust_ready: Arc<AtomicBool>,
     pub browser_mitm_warning_cache: Arc<Mutex<HashSet<String>>>,
-    pub web_filter: Arc<super::web_filter::WebFilter>,
     network_whitelist_index: Arc<RwLock<CidrIndex>>,
     /// Retained so stop() can call shutdown() and unblock all recv() threads.
     pub divert_handle: Arc<Mutex<Option<WinDivertArc<windivert::prelude::NetworkLayer>>>>,
@@ -1502,7 +1501,6 @@ impl FirewallEngine {
         // We do NOT hardcode them here to allow user to override/remove them.
 
         let network_whitelist_index = Arc::new(RwLock::new(CidrIndex::from_cidrs(&[])));
-        let web_filter = Arc::new(super::web_filter::WebFilter::load_default());
         let app_manager = Arc::new(AppManager::new(HashMap::new()));
         let settings = Arc::new(RwLock::new(settings_data));
         let sdk = Arc::new(RwLock::new(super::sdk::SdkRegistry::with_defaults()));
@@ -1517,7 +1515,6 @@ impl FirewallEngine {
             stats,
             dns_handler,
             app_manager,
-            web_filter,
             settings,
             stop_signal,
             sdk,
@@ -1536,147 +1533,23 @@ impl FirewallEngine {
         PathBuf::from("json/settings.json")
     }
 
-    fn pdata_settings_path() -> PathBuf {
-        PathBuf::from(r"C:\ProgramData\edrsvc\firewall_settings.json")
-    }
-
-    /// All locations where the shipped "json/settings.json" template may live.
-    /// Order matters: exe directory first (service install), then the canonical
-    /// Program Files path, then the CWD-relative path (dev runs).
-    /// A bare relative path alone breaks when running as a Windows service
-    /// because the service CWD is System32, not the install dir.
-    fn template_candidates() -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                out.push(dir.join("json").join("settings.json"));
-            }
-        }
-        out.push(PathBuf::from(
-            r"C:\Program Files\HydraDragonAntivirus\OpenEDR\json\settings.json",
-        ));
-        out.push(PathBuf::from("json/settings.json"));
-        // Deduplicate while preserving order.
-        let mut seen = HashSet::new();
-        out.into_iter()
-            .filter(|p| seen.insert(p.clone()))
-            .collect()
-    }
-
     pub fn load_settings() -> Option<FirewallSettings> {
-        let pdata = Self::pdata_settings_path();
-        // 1. PRIORITY: template in Program Files / exe directory.
-        //    If it exists and is valid JSON, read it, copy its contents
-        //    verbatim to ProgramData (overwrite), and load it into memory.
-        //    Never invent defaults here, never read the stale ProgramData file.
-        for template in Self::template_candidates() {
-            let Ok(template_content) = fs::read_to_string(&template) else {
-                continue;
-            };
-            match serde_json::from_str::<FirewallSettings>(&template_content) {
-                Ok(settings) => {
-                    Self::ensure_pdata_settings(&template_content);
+        let path = Self::settings_path();
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(settings) = serde_json::from_str::<FirewallSettings>(&content) {
                     return Some(settings);
                 }
-                Err(e) => {
-                    // Template exists but is not valid JSON: do not overwrite
-                    // ProgramData; keep looking / fall through to fallback.
-                    eprintln!(
-                        "[firewall] ignoring invalid template {}: {e}",
-                        template.display()
-                    );
-                }
             }
         }
-        // 2. FALLBACK: only if no template was found / valid,
-        //    look at the ProgramData file.
-        if let Ok(content) = fs::read_to_string(&pdata) {
-            if let Ok(settings) = serde_json::from_str::<FirewallSettings>(&content) {
-                return Some(settings);
-            }
-        }
-        // 3. Last resort: produce a default (in memory only, no disk write).
-        Some(FirewallSettings::default())
-    }
 
-    /// Copies the verified contents of the "json/settings.json" template
-    /// verbatim to "C:\ProgramData\edrsvc\firewall_settings.json" (overwrite).
-    /// Never generates default settings, never reads the existing ProgramData
-    /// file. `template_content` must have been validated as proper JSON beforehand.
-    fn ensure_pdata_settings(template_content: &str) {
-        let pdata = Self::pdata_settings_path();
-        if let Some(parent) = pdata.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!(
-                    "[firewall] failed to create ProgramData dir {}: {e}",
-                    parent.display()
-                );
-                return;
-            }
+        // Create and save settings.json directly with default settings if it doesn't exist
+        let default_settings = FirewallSettings::default();
+        if let Ok(json_str) = serde_json::to_string_pretty(&default_settings) {
+            let _ = fs::create_dir_all("json");
+            let _ = fs::write(&path, json_str);
         }
-        if let Err(e) = fs::write(&pdata, template_content) {
-            eprintln!(
-                "[firewall] failed to copy template to {}: {e}",
-                pdata.display()
-            );
-        }
-    }
-
-    pub fn save_settings(&self) {
-        let current_settings = self.settings.read().unwrap().clone();
-
-        let settings = FirewallSettings {
-            kernel_block_paths: current_settings.kernel_block_paths.clone(),
-            late_blocking_mode: current_settings.late_blocking_mode,
-            headless_mode: current_settings.headless_mode,
-            log_mode: current_settings.log_mode,
-            show_blocked_logs_only: current_settings.show_blocked_logs_only,
-            show_blocked_graphics_only: current_settings.show_blocked_graphics_only,
-            show_blocked_http_inspector_only: current_settings.show_blocked_http_inspector_only,
-            no_alert_mode: current_settings.no_alert_mode,
-            save_all_logs: current_settings.save_all_logs,
-            prune_old_logs: current_settings.prune_old_logs,
-            max_visible_logs: current_settings.max_visible_logs,
-            prune_http_history: current_settings.prune_http_history,
-            max_visible_http_events: current_settings.max_visible_http_events,
-            log_full_bodies: current_settings.log_full_bodies,
-            tls_proxy: current_settings.tls_proxy.clone(),
-            metadata: current_settings.metadata.clone(),
-        };
-
-        if let Ok(content) = serde_json::to_string_pretty(&settings) {
-            // Keep both files in sync: ProgramData and the local template.
-            // Write to ProgramData plus every known template location so the
-            // install-dir copy and the dev-relative copy stay identical.
-            let pdata = Self::pdata_settings_path();
-            if let Some(parent) = pdata.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    eprintln!(
-                        "[firewall] save_settings: failed to create {}: {e}",
-                        parent.display()
-                    );
-                }
-            }
-            if let Err(e) = fs::write(&pdata, &content) {
-                eprintln!(
-                    "[firewall] save_settings: failed to write {}: {e}",
-                    pdata.display()
-                );
-            }
-            for template in Self::template_candidates() {
-                if let Some(parent) = template.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                }
-                if let Err(e) = fs::write(&template, &content) {
-                    eprintln!(
-                        "[firewall] save_settings: failed to write {}: {e}",
-                        template.display()
-                    );
-                }
-            }
-        }
+        Some(default_settings)
     }
 
     pub fn apply_settings(&self, new_settings: FirewallSettings) {
@@ -1811,6 +1684,15 @@ impl FirewallEngine {
             self.start_embedded_proxy(&tls_proxy_cfg);
         } else {
             self.stop_embedded_proxy();
+        }
+    }
+
+    pub fn save_settings(&self) {
+        let current_settings = self.settings.read().unwrap().clone();
+        if let Ok(json_str) = serde_json::to_string_pretty(&current_settings) {
+            let path = Self::settings_path();
+            let _ = fs::create_dir_all("json");
+            let _ = fs::write(&path, json_str);
         }
     }
 
@@ -2003,7 +1885,6 @@ impl FirewallEngine {
 
         let sdk = self.sdk.clone();
         let settings = self.settings.clone();
-        let web_filter = self.web_filter.clone();
 
         let Ok(ca_bundle) = super::proxy::generate_ca() else {
             let now = Self::now_ts();
@@ -2022,7 +1903,6 @@ impl FirewallEngine {
             ca_bundle.issuer,
             sdk,
             settings,
-            web_filter,
             stop_rx_main,
         ));
 
@@ -2772,7 +2652,6 @@ impl FirewallEngine {
             let fcheck_w = Arc::clone(&self.file_checker);
             let browser_mitm_warning_cache_w = Arc::clone(&self.browser_mitm_warning_cache);
             let network_whitelist_index_w = Arc::clone(&self.network_whitelist_index);
-            let web_filter_w = Arc::clone(&self.web_filter);
             let divert_w = divert.clone();
             let net_ev_tx = net_event_tx.clone();
             let nat_table_w = self.nat_table.clone();
@@ -2863,7 +2742,6 @@ impl FirewallEngine {
                                     &pre_parsed,
                                     &browser_mitm_warning_cache_w,
                                     &network_whitelist_index_w,
-                                    &web_filter_w,
                                 );
 
                                 // Firewall activity telemetry. Network blocks stay in the
@@ -2987,14 +2865,8 @@ impl FirewallEngine {
                                                         let host_candidate = pre_parsed.as_ref()
                                                             .and_then(|(p, _)| p.hostname.as_deref())
                                                             .or(host_resolved.as_deref());
-                                                        // SDK-compatible verdict: steer only targets
-                                                        // named by monitored_sites.yaml or an active
-                                                        // SDK domain rule. Unidentified targets stay
-                                                        // direct (fail open).
-                                                        match host_candidate {
-                                                            Some(h) => sdk_w.read().unwrap().is_monitored_site(h),
-                                                            None => false,
-                                                        }
+                                                        let sdk_guard = sdk_w.read().unwrap();
+                                                        sdk_guard.has_target_rule(host_candidate, Some(orig_dst))
                                                     };
 
                                                     if should_intercept
@@ -3115,7 +2987,6 @@ impl FirewallEngine {
         pre_parsed: &Option<(PacketInfo, usize)>,
         browser_mitm_warning_cache: &Arc<Mutex<HashSet<String>>>,
         network_whitelist_index: &Arc<RwLock<CidrIndex>>,
-        web_filter: &Arc<super::web_filter::WebFilter>,
     ) -> PacketDecision {
         let (mut info, mut payload_offset) = match pre_parsed {
             Some(p) => (p.0.clone(), p.1),
@@ -3211,40 +3082,32 @@ impl FirewallEngine {
             }
         }
 
-        // --- Pure CIDR Blacklist Scan (WebFilter) ---
+        // ── Clean CIDR IP Threat Intelligence Scan ─────────────────────────
         // Evaluates remote IP against curated CIDR ranges (CIDRBlackListIPv4/v6.txt).
-        // Works in all modes (MetadataOnly, TlsProxy, or direct). Private and
-        // local addresses are never matched; per-flow results are cached.
+        // Works in all modes (MetadataOnly, TlsProxy, or direct). Zero false positives.
         let remote_ip = if info.outbound { info.dst_ip } else { info.src_ip };
-        let is_private_or_local = match remote_ip {
-            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_broadcast() || v4.is_unspecified(),
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
-        if !is_private_or_local {
-            let flow_key = (info.src_ip, info.dst_ip, info.dst_port);
-            if let Some(web_match) = web_filter.find_match_cached(flow_key, remote_ip) {
-                stats.packets_total.fetch_add(1, Ordering::Relaxed);
-                stats.packets_blocked.fetch_add(1, Ordering::Relaxed);
+        if let Some(reason_str) = am.threat_intel.check_ip(remote_ip) {
+            stats.packets_total.fetch_add(1, Ordering::Relaxed);
+            stats.packets_blocked.fetch_add(1, Ordering::Relaxed);
 
-                let now = Self::now_ts();
-                emit_log_event(LogEntry {
-                    id: format!("{}-cidr-{}", now, pid),
-                    timestamp: now,
-                    level: LogLevel::Warning,
-                    message: format!(
-                        "CIDR Blocked: {} (pid={}) -> {}:{} ({})",
-                        app_info.name, pid, remote_ip, info.dst_port, web_match.reason
-                    ),
-                });
+            let now = Self::now_ts();
+            emit_log_event(LogEntry {
+                id: format!("{}-cidr-threatintel-{}", now, pid),
+                timestamp: now,
+                level: LogLevel::Warning,
+                message: format!(
+                    "ThreatIntel Event: {} (pid={}) -> {}:{} reason={}",
+                    app_info.name, pid, remote_ip, info.dst_port, reason_str
+                ),
+            });
 
-                return PacketDecision {
-                    packet_data: data.to_vec(),
-                    address_data: address_data.to_vec(),
-                    should_forward: false,
-                    recalc_checksums: false,
-                    _reason: web_match.reason,
-                };
-            }
+            return PacketDecision {
+                packet_data: data_vec,
+                address_data: address_data.to_vec(),
+                should_forward: false,
+                recalc_checksums: false,
+                _reason: format!("CIDR ThreatIntel Block: {}", reason_str),
+            };
         }
 
         // 3. DNS Snooping Enrichment (CRITICAL: Do this before rules!)
@@ -3854,15 +3717,6 @@ impl FirewallEngine {
             (0, 0)
         };
 
-        // Raw TCP flags byte (offset 13 of the TCP header), when present.
-        // Parsed here (not via fixed raw offsets downstream) so variable
-        // IP/TCP header lengths (IPv4 options, IPv6) are accounted for.
-        let tcp_flags = if matches!(protocol, Protocol::TCP) && header_len + 14 <= data.len() {
-            Some(data[header_len + 13])
-        } else {
-            None
-        };
-
         let mut payload_start = header_len;
         if matches!(protocol, Protocol::TCP) {
             let tcp_header_start = header_len;
@@ -3996,7 +3850,6 @@ impl FirewallEngine {
                 http_referer,
                 payload_entropy,
                 payload_sample,
-                tcp_flags,
                 payload_urls,
                 payload_domains,
                 image_path: cache.get_info(process_id).path,
